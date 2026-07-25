@@ -3,7 +3,7 @@
 **/*.rs.bk
 
 # Datasets: downloaded, never committed (see scripts/download_datasets.sh)
-# In the WSL2 setup this is a symlink to an ext4 path — see docs/DESIGN.md.
+# Under WSL2 the real location is $ANKA_DATASETS on ext4 — see docs/DESIGN.md.
 /datasets
 
 # Index artifacts

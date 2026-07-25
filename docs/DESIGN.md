@@ -322,7 +322,7 @@ Layout matters under WSL2, where `/mnt/c` is markedly slower than ext4:
 |---|---|---|
 | Source | `/mnt/c/...` | reachable from Windows editors |
 | Build output | `CARGO_TARGET_DIR` on ext4 | compile times |
-| Datasets | ext4, symlinked as `datasets/` | I/O measurements should mean something |
+| Datasets | ext4, located via `$ANKA_DATASETS` | I/O measurements should mean something |
 | Snapshot/WAL tests | ext4 (`$TMPDIR`) | realistic `fsync` semantics |
 
 Benchmarks are built with `RUSTFLAGS="-C target-cpu=native"`; CI is not, since the runner is a
