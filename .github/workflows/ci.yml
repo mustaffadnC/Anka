@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Deliberately NOT setting RUSTFLAGS here. `-C target-cpu=native` would be wrong
+  # (the runner is a different machine than the one benchmarks are measured on), and a
+  # global `-D warnings` would also promote *dependency* warnings to errors. Warnings
+  # are denied per-invocation on our own crates instead, via the clippy step below.
+
+jobs:
+  check:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Keep in sync with rust-toolchain.toml. Once that file pins an exact version,
+      # switch this to dtolnay/rust-toolchain@master with a matching `toolchain:` input.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-features
+
+  # Added in phase 2: builds a small index on `siftsmall` and fails the build if
+  # recall@10 drops below the threshold. Correctness regression, not a perf gate.
+  #
+  # recall-regression:
+  #   runs-on: ubuntu-latest
+  #   ...
