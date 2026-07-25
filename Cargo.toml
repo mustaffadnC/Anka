@@ -1,0 +1,30 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/mustaffadnC/Anka"
+authors = ["Mustafa Din"]
+
+[workspace.dependencies]
+anka-core = { path = "crates/anka-core" }
+anka-index = { path = "crates/anka-index" }
+anka-store = { path = "crates/anka-store" }
+# External dependencies are added with `cargo add` (pinned to exact versions at that
+# point) as each phase needs them, rather than guessed ahead of time.
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# Symbols are kept in release builds on purpose: profiling with flamegraph / cachegrind /
+# uProf is part of the workflow, and stripped release binaries make the output useless.
+debug = true
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1
+debug = true

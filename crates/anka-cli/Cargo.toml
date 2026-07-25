@@ -1,0 +1,21 @@
+[package]
+name = "anka-cli"
+description = "Command-line interface for Anka"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "anka"
+path = "src/main.rs"
+
+[features]
+stats = ["anka-index/stats"]
+
+[dependencies]
+anka-core.workspace = true
+anka-index.workspace = true
+anka-store.workspace = true

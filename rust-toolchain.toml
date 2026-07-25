@@ -1,0 +1,6 @@
+[toolchain]
+# Pinned for reproducibility (see docs/DESIGN.md, "Reproducibility contract").
+# TODO(phase-0): replace "stable" with the exact version reported by `rustc -V`
+# once the toolchain is installed, and switch the CI action to a matching pin.
+channel = "stable"
+components = ["rustfmt", "clippy"]

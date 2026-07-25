@@ -1,0 +1,27 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Datasets: downloaded, never committed (see scripts/download_datasets.sh)
+# In the WSL2 setup this is a symlink to an ext4 path — see docs/DESIGN.md.
+/datasets
+
+# Index artifacts
+*.anka
+*.anka.tmp
+wal.log
+
+# Python tooling for dataset conversion and the hnswlib baseline
+.venv/
+__pycache__/
+*.pyc
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Internal Turkish working spec — not part of the published repository.
+# The repo-facing design document is docs/DESIGN.md.
+ANKA_PROJE_SPEC.md

@@ -1,0 +1,17 @@
+[package]
+name = "anka-index"
+description = "HNSW graph index, brute-force baseline and quantization for Anka"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+stats = ["anka-core/stats"]
+
+[dependencies]
+anka-core.workspace = true
+
+[dev-dependencies]

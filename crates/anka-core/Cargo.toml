@@ -1,0 +1,18 @@
+[package]
+name = "anka-core"
+description = "Core types, vector storage and distance kernels for Anka"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+# Instrumentation for the distance-computation counter. It lives in the hottest loop,
+# so it must be opt-in: a build with `stats` on does not produce publishable QPS numbers.
+stats = []
+
+[dependencies]
+
+[dev-dependencies]

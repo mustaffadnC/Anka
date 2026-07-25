@@ -1,0 +1,18 @@
+# Normalise line endings. Development happens on Windows (via WSL2) while CI runs
+# on Linux; without this, `cargo fmt --check` fails on CRLF.
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.py   text eol=lf
+*.rs   text eol=lf
+*.toml text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+
+# Binary formats
+*.png   binary
+*.pdf   binary
+*.fvecs binary
+*.ivecs binary
+*.hdf5  binary
+*.anka  binary

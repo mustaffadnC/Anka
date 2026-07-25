@@ -1,0 +1,15 @@
+[package]
+name = "anka-store"
+description = "Snapshot, write-ahead log and crash recovery for Anka"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+anka-core.workspace = true
+anka-index.workspace = true
+
+[dev-dependencies]
