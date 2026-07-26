@@ -1,6 +1,5 @@
 [toolchain]
 # Pinned for reproducibility (see docs/DESIGN.md, "Reproducibility contract").
-# TODO(phase-0): replace "stable" with the exact version reported by `rustc -V`
-# once the toolchain is installed, and switch the CI action to a matching pin.
-channel = "stable"
+# Keep in sync with the `toolchain:` input in .github/workflows/ci.yml.
+channel = "1.97.1"
 components = ["rustfmt", "clippy"]

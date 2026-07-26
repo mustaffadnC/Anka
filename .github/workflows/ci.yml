@@ -19,11 +19,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Keep in sync with rust-toolchain.toml. Once that file pins an exact version,
-      # switch this to dtolnay/rust-toolchain@master with a matching `toolchain:` input.
-      - uses: dtolnay/rust-toolchain@stable
+      # Must match the `channel` in rust-toolchain.toml, otherwise the toolchain gets
+      # installed twice: once by this action and once by rustup honouring that file.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.97.1"
           components: rustfmt, clippy
+
+      - name: Toolchain
+        run: rustc -V && cargo -V && rustup show active-toolchain
 
       - uses: Swatinem/rust-cache@v2
 
