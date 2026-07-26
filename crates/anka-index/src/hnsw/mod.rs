@@ -1,0 +1,17 @@
+//! Hierarchical Navigable Small World index.
+//!
+//! Follows Malkov & Yashunin, arXiv:1603.09320, algorithms 1–5. The layout and the places where
+//! a straightforward reading of the paper yields a working-but-wrong index are written up in
+//! `docs/DESIGN.md`, section 6.
+//!
+//! Built bottom-up, one piece per commit:
+//!
+//! - [`layer`] — flat adjacency, sparse above layer 0
+//! - [`visited`] — epoch-stamped per-query membership set
+//! - search, neighbour selection and insert follow
+
+pub mod layer;
+pub mod visited;
+
+pub use layer::Layer;
+pub use visited::VisitedList;
