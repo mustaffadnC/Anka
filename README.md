@@ -8,11 +8,16 @@ repositories say "I implemented HNSW". This one aims to say: *I implemented HNSW
 recall/QPS Pareto curves on SIFT1M and GloVe-100, compared them against hnswlib under
 identical parameters on identical hardware, and profiled where the difference comes from.*
 
-> **Status: under construction.** Phase 0 is done — the workspace, CI, dataset readers and
-> memory reporting are in place, and SIFT1M, siftsmall and GloVe-100 all load and verify.
-> No search performance numbers are published yet, and none will be until they come from a
-> script anyone can re-run. See [docs/RESULTS.md](docs/RESULTS.md) for what has actually been
-> measured, and the roadmap below for what is coming.
+> **Status: under construction.** Phases 0 and 1 are done: the distance kernels are verified
+> against the published SIFT1M and GloVe-100 ground truth, and exact brute-force search is in
+> place as the reference every later phase is measured against. The HNSW index itself is next,
+> so there are no recall/QPS curves yet — and there will be none until they come from a script
+> anyone can re-run. See [docs/RESULTS.md](docs/RESULTS.md) for what has actually been measured.
+>
+> One early result worth the click: brute-force scan over SIFT1M runs at **49.4 GB/s**, which is
+> this machine's DDR5 ceiling. The AVX2 kernel is 12.9× faster than the reference *in cache* and
+> only 1.20× faster on the full dataset — it is waiting on memory, not arithmetic. Which is the
+> argument for building an index at all.
 
 ---
 
@@ -36,7 +41,7 @@ you prune a neighbour list, and how entry-point selection shapes traversal.
 | H6 | Reproducibility | One command regenerates every curve (fixed seed, pinned versions) |
 
 Explicit non-goals: distributed architecture, disk-resident index (DiskANN-style), ACID
-transactions, GPU indexing, an AVX-512 code path (see [docs/DESIGN.md](docs/DESIGN.md) §9), and
+transactions, GPU indexing, an AVX-512 code path (see [docs/DESIGN.md](docs/DESIGN.md) §10), and
 any claim of production readiness.
 
 ## Roadmap
@@ -44,8 +49,8 @@ any claim of production readiness.
 | Phase | Scope | Status |
 |---|---|---|
 | 0 | Workspace, CI, `.fvecs`/`.ivecs` readers, `VectorStore` | ✅ done |
-| 1 | Distance metrics (scalar + AVX2), brute force, ground truth | 🚧 next |
-| 2 | HNSW core, `ef`/`M` sweeps, hnswlib comparison | ⬜ |
+| 1 | Distance metrics (scalar + AVX2), brute force, ground truth | ✅ done |
+| 2 | HNSW core, `ef`/`M` sweeps, hnswlib comparison | 🚧 next |
 | 3 | Snapshot, WAL, crash recovery | ⬜ |
 | — | **Benchmark showcase** — the milestone that makes this repo self-contained | ⬜ |
 | 4 | Deletion (tombstones + compaction), metadata filtering | ⬜ |

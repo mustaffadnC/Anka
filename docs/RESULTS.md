@@ -4,7 +4,7 @@ Every number in this document comes from a command recorded next to it. Nothing 
 estimate, an expectation, or a figure typed in by hand. Sections are filled in as phases land,
 not at the end.
 
-**Status:** phase 0 complete. Phase 1 not started.
+**Status:** phases 0 and 1 complete. Phase 2 (HNSW) not started.
 
 ---
 
@@ -21,12 +21,12 @@ numbers.
 | OS | Ubuntu 26.04 LTS on WSL2, kernel 6.18.33.2-microsoft-standard-WSL2, WSL 2.7.11.0 |
 | Host OS | Windows 11 Pro 26200.8875 |
 | `rustc -V` | 1.97.1 (8bab26f4f 2026-07-14), pinned in `rust-toolchain.toml` |
-| `RUSTFLAGS` | unset for the numbers below; `-C target-cpu=native` from phase 1 onwards |
+| `RUSTFLAGS` | `-C target-cpu=native` for every phase 1 measurement; unset for the phase 0 load times |
 | Release profile | `lto = "thin"`, `codegen-units = 1`, debug symbols kept for profiling |
 | Storage | datasets and build output on ext4, source tree on `/mnt/c` |
 | RNG seed | not applicable yet — nothing is random before phase 2 |
-| Clock-variance handling | none applied; phase 0 makes no throughput claim |
-| Query threads | 1 |
+| Clock-variance handling | **not yet applied.** The Windows power plan has not been pinned, contrary to spec section 6 rule 3. Repeatability was measured instead: 0.05–0.23% spread across full runs. This is adequate for measurements lasting minutes and will need fixing before phase 2's `ef` sweeps. |
+| Query threads | 1 for the criterion benchmarks; 12 (rayon) for ground-truth generation, noted where it applies |
 
 ### Datasets
 
@@ -106,19 +106,150 @@ Malformed input returns an error and never panics. Covered by tests:
 
 ## 2. Phase 1 — Distance kernels and ground truth
 
-### SIMD vs scalar
-
-| Metric | Dim | Scalar (ns/op) | SIMD (ns/op) | Speed-up |
-|---|---|---|---|---|
-| *pending* | | | | |
-
 ### Ground truth verification
+
+`anka gt <dataset> --k 100`, reference kernel (`f64` accumulator) against the dataset's
+published `.ivecs` list.
+
+| | siftsmall | SIFT1M | GloVe-100 |
+|---|---|---|---|
+| Queries × base | 100 × 10 000 | 10 000 × 1 000 000 | 10 000 × 1 183 514 |
+| Metric | L2² | L2² | cosine |
+| Positions with the same id | 9 982 / 10 000 (99.82%) | 980 481 / 1 000 000 (98.05%) | 999 957 / 1 000 000 (99.996%) |
+| Rows identical in order | 91 / 100 | 4 446 / 10 000 | 9 978 / 10 000 |
+| Rows with the same neighbour **set** | 100 / 100 | 9 889 / 10 000 | 9 999 / 10 000 |
+| Differing positions at **equal distance** | 18 / 18 | 19 519 / 19 519 | 43 / 43 |
+| Largest relative distance gap | `0.000e0` | `0.000e0` | `6.44e-8` |
+| Verdict | **exact** | **exact** | **exact** |
+
+GloVe's gap is not exactly zero because cosine normalises first, and a division does not produce
+bit-identical results the way a sum of squares does. At `6.44e-8` it is inside one f32 ULP
+(`ε ≈ 1.19e-7`), so those neighbours are equidistant to the limit of the representation.
+
+**Every disagreement is between neighbours at bit-identical distances.** Since both lists are
+sorted ascending by distance, matching at every rank means the two sorted distance sequences are
+identical — and a list of `k` items whose distance sequence equals that of a known-exact top-`k`
+is itself an exact top-`k`.
+
+This is a *stronger* claim than "the ids match", and it is the only achievable one. Two effects
+produce the differences, neither a defect:
+
+- **Tie order is arbitrary.** Which of two exactly-equidistant neighbours comes first follows an
+  undocumented rule in the published list. No tie-break reproduces it and none is more correct.
+  Concretely, SIFT1M query 5 differs at rank 1: ours `[187470, 67875, 220473, …]`, published
+  `[187470, 220473, 67875, …]` — an adjacent swap of two vectors at the same distance.
+- **When a tie straddles rank `k`, the top-`k` set is not unique.** Several vectors compete for
+  the last slot at the same distance and any choice is exact. This accounts for all 111 SIFT1M
+  queries whose sets differ.
+
+Recall is unaffected: `recall@k = |returned ∩ true_top_k| / k` depends on the set, and the
+residual ambiguity is confined to the last slot of 111 of 10 000 queries.
+
+The spec originally required a 100% id match. That criterion was wrong, and the measurement is
+what showed it; see the v1.2 revision note in the working spec.
+
+### Kernel agreement
 
 | Check | Result |
 |---|---|
-| Scalar-generated GT vs official SIFT1M `.ivecs` | *pending* (target: 100%) |
-| SIMD-generated GT vs scalar GT | *pending* (target: distance-equivalent) |
-| SIMD ≡ scalar, relative tolerance 1e-6 (proptest) | *pending* |
+| SIMD vs reference ids, siftsmall | 10 000 / 10 000 positions identical |
+| SIMD vs reference ids, SIFT1M | 1 000 000 / 1 000 000 positions identical |
+| SIMD vs reference ids, GloVe-100 | 999 904 / 1 000 000; **96 / 96 differing positions equidistant**, largest gap `2.78e-7` |
+| SIMD ≡ reference, dims 1–40, 64, 96, 100, 127, 128, 129, 768 | pass |
+| SIMD ≡ reference, SIFT-shaped data (0–255, dim 128, L2² ≈ 8.3e6) | pass |
+| SIMD ≡ reference, proptest fuzz (L2², dot, cosine) | pass |
+| Cosine rejects the zero vector | pass |
+| Cosine and the readers reject NaN/±∞ | pass |
+
+GloVe is the case that justifies the choice of bar. On both SIFT datasets the SIMD kernel returned
+*identical ids* to the f64 reference — the difference in summation order never mattered. On GloVe
+it did: 96 positions came back in a different order. Cosine distances there cluster near 1.0 with
+minute separations between similar directions, so a rounding difference of one part in 10⁷ is
+enough to swap two neighbours. All 96 are equidistant to within `2.78e-7`. Had id equality been
+the criterion, this would read as a failure; it is not one.
+
+Tolerance is relative to `Σ|aᵢbᵢ|`, the magnitude the sum accumulates, not to the result: for a
+dot product with mixed signs the terms cancel, so the result can approach zero while the absolute
+error stays where it was.
+
+### Kernel throughput, in cache
+
+`cargo bench -p anka-bench`, `RUSTFLAGS="-C target-cpu=native"`, single thread. Each case scans a
+block of 4096 vectors; at dim 128 that is 2 MiB, which fits in L3 on purpose — this measures the
+kernel, not DDR5. Times are criterion's median estimate.
+
+| Metric | Dim | Reference | SIMD | Speed-up | SIMD throughput |
+|---|---|---|---|---|---|
+| L2² | 100 | 213.0 µs | 20.8 µs | 10.2× | 19.7 Gelem/s |
+| L2² | 128 | 282.0 µs | 21.9 µs | **12.9×** | **23.9 Gelem/s** |
+| L2² | 768 | 1832.5 µs | 147.6 µs | 12.4× | 21.3 Gelem/s |
+| dot | 100 | 206.9 µs | 18.9 µs | 11.0× | 21.7 Gelem/s |
+| dot | 128 | 278.1 µs | 19.3 µs | 14.4× | 27.2 Gelem/s |
+| dot | 768 | 1847.3 µs | 141.7 µs | 13.0× | 22.2 Gelem/s |
+| cosine | 100 | 210.9 µs | 20.2 µs | 10.5× | 20.3 Gelem/s |
+| cosine | 128 | 279.8 µs | 17.8 µs | 15.8× | 29.5 Gelem/s |
+| cosine | 768 | 1842.1 µs | 136.8 µs | 13.5× | 23.0 Gelem/s |
+
+**These ratios are larger than they look, and the reason is the baseline, not the kernel.** The
+reference accumulates in `f64` through a single accumulator, because it exists to be correct.
+That leaves it latency-bound on its own dependency chain: it sustains ~1.9 Gelem/s ≈ 0.38 elements
+per cycle, which is what one f64 addition every 3–4 cycles looks like. The SIMD kernel uses four
+independent accumulators specifically to avoid that. So 13× is the honest ratio between *these two
+implementations*, and it is not the ratio an optimised scalar f32 loop would show. The spec's
+original 3–6× expectation was calibrated against that different baseline.
+
+`dot` and `cosine` compute the same thing (`cosine` is `1 - dot`), so the ~8% gap between them at
+dim 128 is measurement noise and code layout, not a real difference. It is a fair indication of
+this benchmark's precision.
+
+### Kernel throughput, out of cache — the memory wall
+
+| Working set | Size | Reference | SIMD | Speed-up |
+|---|---|---|---|---|
+| siftsmall, `anka gt` | ~5 MiB, fits L3 | 11.6 ms | 2.6 ms | 4.5× |
+| SIFT1M, `anka gt` | 488 MiB | 124.19 s | 103.69 s | **1.20×** |
+| GloVe-100, `anka gt` | 451 MiB | 120.56 s | 95.68 s | **1.26×** |
+
+The full-dataset scans move 10 000 × 488 MiB ≈ 4.66 TiB (SIFT1M) and 4.31 TiB (GloVe) through the
+kernel. The achieved rates are:
+
+| | Bytes/s | Gelem/s (12 threads) |
+|---|---|---|
+| SIFT1M, SIMD | **49.4 GB/s** | 12.3 |
+| GloVe-100, SIMD | **49.5 GB/s** | 12.4 |
+| SIFT1M, reference | 41.2 GB/s | 10.3 |
+
+Two datasets with different dimensionality (128 and 100) and different metrics land on the same
+**≈49.5 GB/s** ceiling, which is what dual-channel DDR5 delivers in practice on this machine. That
+is the diagnosis: the kernel is waiting on DRAM, not on arithmetic.
+
+The in-cache figure quantifies how badly. One core running the SIMD kernel at 23.9 Gelem/s
+consumes database bytes at **95.6 GB/s** — roughly twice what DRAM supplies to the whole
+package. A single thread is therefore already memory-bound on a 488 MiB dataset, and the eleven
+others buy almost nothing. Hence 1.20× end-to-end from a kernel that is 12.9× faster in cache.
+
+Two consequences, both of which change what phase 2 measures:
+
+1. A speed-up figure without a working-set size is uninterpretable. Every one above carries its
+   size.
+2. **The value of HNSW is not faster distance computation, it is far fewer of them.** Brute force
+   has already hit the memory wall, so there is nothing left to win in the kernel. That makes
+   `distance_computations` the primary metric for phase 2, with QPS a consequence of it rather
+   than an independent result.
+
+### Repeatability
+
+| Measurement | Run 1 | Run 2 | Spread |
+|---|---|---|---|
+| SIFT1M reference kernel | 123.91 s | 124.19 s | 0.23% |
+| SIFT1M SIMD kernel | 103.74 s | 103.69 s | 0.05% |
+
+Peak RSS for the full SIFT1M verification (base, queries, published list and two computed lists
+all resident): 515.1 MiB. GloVe: 477.2 MiB.
+
+Ground-truth generation is parallel over queries (rayon, 12 threads), so the `anka gt` figures are
+wall-clock for the whole job. Spec section 6 requires *query* throughput to be single-threaded;
+that measurement arrives in phase 2.
 
 ---
 

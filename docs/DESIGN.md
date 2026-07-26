@@ -197,11 +197,50 @@ L2 reaches ~8.3e6; with fp32 epsilon at ~1.19e-7 the expected absolute error aft
 accumulations is on the order of 10. An absolute threshold like `1e-5` cannot hold there, while
 the same relative threshold works for both SIFT (~1e6) and normalised GloVe (~1).
 
-For the same reason, the "100% match against the official ground truth" requirement applies to
-the **scalar** kernel. SIMD changes the summation order, which changes rounding, which can swap
-two near-equidistant neighbours. For SIMD, distance-equivalence is the bar.
+The tolerance is relative to **what the sum accumulates**, `Σ|aᵢbᵢ|`, not to the result. For
+squared L2 the two are the same thing, since every term is non-negative. For a dot product they
+are not: with mixed signs the terms cancel, so the result can land arbitrarily close to zero
+while the absolute error stays exactly where it was. A test written against the result passes on
+positive data and fails the moment signs are involved.
 
-## 5. HNSW notes
+## 5. Ground truth
+
+Exact neighbour lists come from the reference kernel, and the published SIFT1M list is the only
+external check this project has on its own arithmetic.
+
+The bar is that our **distance profile** matches the published one: for every query and every
+rank, the distance to our neighbour equals the distance to theirs. Both lists are sorted
+ascending by distance, so that makes the two sorted distance sequences identical — and a list of
+`k` items whose distance sequence equals that of a known-exact top-`k` is itself an exact
+top-`k`. Anything less than exact would have to contain an item beyond the true `k`-th distance,
+and that would show up in the profile.
+
+Id equality is *not* the bar, because it is unachievable and because it does not imply
+correctness. Measured on SIFT1M with `k = 100`:
+
+| | siftsmall | SIFT1M |
+|---|---|---|
+| Positions with the same id | 9 982 / 10 000 | 980 481 / 1 000 000 |
+| Rows identical in order | 91 / 100 | 4 446 / 10 000 |
+| Rows with the same neighbour **set** | 100 / 100 | 9 889 / 10 000 |
+| Differing positions at equal distance | 18 / 18 | 19 519 / 19 519 |
+| Largest relative distance gap | `0.000e0` | `0.000e0` |
+
+Every single disagreement is between neighbours at **bit-identical** distances. Two separate
+effects produce them, and neither is a defect:
+
+- **Tie order is arbitrary.** When two neighbours are exactly equidistant, which one comes first
+  in the published list follows an undocumented rule. No tie-break reproduces it and none is
+  more correct.
+- **When a tie straddles rank `k`, the top-`k` set is not unique.** Several vectors compete for
+  the last slot at the same distance; any choice is an exact answer. On SIFT1M this happens for
+  111 of 10 000 queries.
+
+This matters for recall as well as for correctness: `recall@k = |returned ∩ true_top_k| / k`
+depends on the set, not the order, and the residual ambiguity is confined to the last slot of
+111 queries.
+
+## 6. HNSW notes
 
 Implementation follows Malkov & Yashunin (arXiv:1603.09320), algorithms 1–5. Parameters:
 `M = 16`, `Mmax0 = 2M = 32`, `mL = 1/ln(M)`, `ef_construction = 200`, query-time `ef` swept over
@@ -231,7 +270,7 @@ A `distance_computations` counter distinguishes algorithmic wins from micro-opti
 sits in the hottest loop, so it lives behind `#[cfg(feature = "stats")]`. Distance counts and
 QPS come from different runs, and RESULTS.md says so wherever both appear.
 
-## 6. Deletion and filtering (phase 4)
+## 7. Deletion and filtering (phase 4)
 
 Deletion uses tombstones: the `NodeId` goes into a roaring bitmap and is filtered out of
 results, but stays in the graph as a navigational bridge. As the tombstone ratio grows, finding
@@ -263,7 +302,7 @@ selectivity, and **filtered ground truth** is computed by brute force over each 
 Filtered recall cannot be measured against unfiltered ground truth — the reference set would
 simply be the wrong set.
 
-## 7. Quantization (phase 5)
+## 8. Quantization (phase 5)
 
 Per-dimension quantiles (1%–99%) are used as **clipping bounds**, but the scale is **global**:
 `scale = (hi - lo) / 255` with a single `offset`. The reason is arithmetic. With a per-dimension
@@ -303,14 +342,14 @@ in the memory mapping. The 4x reduction is in *resident* vector data (512 MB →
 SIFT1M). Total footprint across RAM and disk does not drop 4x, and RESULTS.md reports both
 numbers separately.
 
-## 8. Concurrency (phase 6)
+## 9. Concurrency (phase 6)
 
 Concurrent insert is out of scope, so there is a single writer: `RwLock<Collection>`, shared for
 search, exclusive for writes. Search is CPU-bound, so it runs under `spawn_blocking` rather than
 directly inside an async handler — otherwise a burst of queries starves the Tokio worker threads
 and the whole server, health endpoint included, stops responding.
 
-## 9. Development environment
+## 10. Development environment
 
 Host: Windows 11 with an AMD Ryzen 5 7600X (Zen 4, 6C/12T), 32 GB DDR5.
 Development and measurement happen in **WSL2 + Ubuntu**, which is also what CI runs, so POSIX
@@ -343,7 +382,7 @@ useful as a ratio) or with AMD uProf against a Windows build, noted as such wher
 And `cpupower frequency-set` cannot work from inside a VM, so clock variance is handled with the
 Windows power plan plus three repetitions and a median.
 
-## 10. Reproducibility contract
+## 11. Reproducibility contract
 
 1. Layer assignment uses `StdRng::seed_from_u64(seed)`; `thread_rng()` appears nowhere. The seed
    is recorded in the snapshot header and in RESULTS.md.
