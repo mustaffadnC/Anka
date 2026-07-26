@@ -5,4 +5,4 @@
 //! phase 1 onwards (distance kernels first, then HNSW search).
 //!
 //! Benchmarks are measured with `RUSTFLAGS="-C target-cpu=native"`; see
-//! `docs/DESIGN.md`, section 9.
+//! `docs/DESIGN.md`, section 10.

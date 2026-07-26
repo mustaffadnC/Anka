@@ -14,3 +14,8 @@ anka-core.workspace = true
 anka-index.workspace = true
 
 [dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+
+[[bench]]
+name = "distance"
+harness = false
