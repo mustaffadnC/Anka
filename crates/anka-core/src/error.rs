@@ -34,6 +34,29 @@ pub enum VectorError {
     #[error("{count} vectors exceeds the NodeId space (u32::MAX)")]
     TooManyVectors { count: usize },
 
+    /// Cosine needs a direction, and a zero vector has none. Normalising one yields NaN,
+    /// which would then quietly destroy the ordering of every heap it touched.
+    #[error("vector {vector} has zero magnitude and cannot be normalised")]
+    ZeroVector { vector: usize },
+
+    #[error("k must be between 1 and the number of vectors ({available}), got {k}")]
+    InvalidK { k: usize, available: usize },
+
+    #[error("id {id} is outside a collection of {count} vectors")]
+    IdOutOfRange { id: crate::NodeId, count: usize },
+
+    #[error(
+        "mismatched shapes: {left} is {left_rows}x{left_cols}, {right} is {right_rows}x{right_cols}"
+    )]
+    ShapeMismatch {
+        left: &'static str,
+        left_rows: usize,
+        left_cols: usize,
+        right: &'static str,
+        right_rows: usize,
+        right_cols: usize,
+    },
+
     #[error("memory-mapped storage is read-only")]
     ReadOnlyStorage,
 
@@ -100,6 +123,26 @@ pub enum DatasetError {
         #[source]
         source: VectorError,
     },
+}
+
+impl VectorError {
+    /// Re-points a per-vector error at its position within a larger collection.
+    ///
+    /// A metric preprocessing a single vector has no idea which one it is; the caller walking
+    /// the collection does. Without this, every such error would read "vector 0".
+    pub(crate) fn at_vector(self, index: usize) -> Self {
+        match self {
+            Self::NonFinite {
+                component, value, ..
+            } => Self::NonFinite {
+                vector: index,
+                component,
+                value,
+            },
+            Self::ZeroVector { .. } => Self::ZeroVector { vector: index },
+            other => other,
+        }
+    }
 }
 
 impl DatasetError {

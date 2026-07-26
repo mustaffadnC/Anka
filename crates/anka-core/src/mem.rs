@@ -12,7 +12,7 @@ pub struct MemoryUsage {
 /// Reads the process's resident set size.
 ///
 /// Linux only, via `/proc/self/status`. Returns `None` everywhere else rather than
-/// approximating: the benchmark environment is Linux (see `docs/DESIGN.md`, section 9), and
+/// approximating: the benchmark environment is Linux (see `docs/DESIGN.md`, section 10), and
 /// in a document whose entire value rests on its numbers being real, a wrong number is worse
 /// than a missing one.
 #[cfg(target_os = "linux")]

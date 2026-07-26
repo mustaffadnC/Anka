@@ -153,6 +153,18 @@ impl VectorStore {
         }
     }
 
+    /// The entire buffer as one mutable flat slice.
+    ///
+    /// Owned storage only — a memory mapping is opened read-only, and the insert path never
+    /// writes through one. Used by [`crate::preprocess_all`] to normalise in place instead of
+    /// copying half a gigabyte to do it.
+    pub fn as_mut_slice(&mut self) -> Result<&mut [f32], VectorError> {
+        match &mut self.storage {
+            Storage::Owned(data) => Ok(data),
+            Storage::Mapped { .. } => Err(VectorError::ReadOnlyStorage),
+        }
+    }
+
     /// The vector at `index`.
     ///
     /// # Panics

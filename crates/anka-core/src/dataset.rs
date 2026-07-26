@@ -415,6 +415,51 @@ mod tests {
         ));
     }
 
+    mod properties {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        proptest! {
+            /// Writing then reading is the identity. Values are bounded away from the
+            /// non-finite range because the reader rejects those on purpose.
+            #[test]
+            fn fvecs_write_then_read_is_the_identity(
+                (dim, data) in (1usize..40).prop_flat_map(|dim| {
+                    (Just(dim), prop::collection::vec(-1.0e6f32..1.0e6f32, dim..=dim * 20))
+                        .prop_map(|(dim, mut data)| {
+                            data.truncate(data.len() / dim * dim);
+                            (dim, data)
+                        })
+                })
+            ) {
+                let (_dir, path) = temp_path("prop.fvecs");
+                write_fvecs(&path, dim, &data).expect("write");
+                let store = read_fvecs(&path).expect("read");
+                prop_assert_eq!(store.dim(), dim);
+                prop_assert_eq!(store.len(), data.len() / dim);
+                prop_assert_eq!(store.as_slice(), data.as_slice());
+            }
+
+            #[test]
+            fn ivecs_write_then_read_is_the_identity(
+                (dim, data) in (1usize..40).prop_flat_map(|dim| {
+                    (Just(dim), prop::collection::vec(any::<i32>(), dim..=dim * 20))
+                        .prop_map(|(dim, mut data)| {
+                            data.truncate(data.len() / dim * dim);
+                            (dim, data)
+                        })
+                })
+            ) {
+                let (_dir, path) = temp_path("prop.ivecs");
+                write_ivecs(&path, dim, &data).expect("write");
+                let matrix = read_ivecs(&path).expect("read");
+                prop_assert_eq!(matrix.dim(), dim);
+                prop_assert_eq!(matrix.as_slice(), data.as_slice());
+            }
+        }
+    }
+
     /// Larger than the 1 MiB read buffer, so the buffered path is exercised across refills
     /// rather than only within a single fill.
     #[test]
