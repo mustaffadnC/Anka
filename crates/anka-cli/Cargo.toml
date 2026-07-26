@@ -19,3 +19,8 @@ stats = ["anka-index/stats"]
 anka-core.workspace = true
 anka-index.workspace = true
 anka-store.workspace = true
+
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
