@@ -35,8 +35,8 @@ you prune a neighbour list, and how entry-point selection shapes traversal.
 | H6 | Reproducibility | One command regenerates every curve (fixed seed, pinned versions) |
 
 Explicit non-goals: distributed architecture, disk-resident index (DiskANN-style), ACID
-transactions, GPU indexing, AVX-512 (not available on the development hardware), and any claim
-of production readiness.
+transactions, GPU indexing, an AVX-512 code path (see [docs/DESIGN.md](docs/DESIGN.md) §9), and
+any claim of production readiness.
 
 ## Roadmap
 

@@ -9,9 +9,9 @@ Anka is a from-scratch ANN search engine whose central claim is measurement qual
 Pareto curves, a fair comparison against hnswlib, and a profile explaining the gap. Three
 choices had to be settled before any code was written, because each one shapes the rest.
 
-The development machine is Windows 11 on a Ryzen 5 7600X (Zen 4: AVX2, no AVX-512) with 32 GB of
-RAM. At the start of the project it had no Rust toolchain, no WSL, no Python, no Docker, and a
-Visual Studio install without the C++ workload.
+The development machine is Windows 11 on a Ryzen 5 7600X (Zen 4, 6C/12T) with 32 GB of RAM. At
+the start of the project it had no Rust toolchain, no WSL, no Python, no Docker, and a Visual
+Studio install without the C++ workload.
 
 ## Decision 1 — Rust
 
@@ -69,7 +69,9 @@ to crates.io, add Apache-2.0 then.
 
 - Benchmarks are built with `RUSTFLAGS="-C target-cpu=native"`; CI is not, because the runner is a
   different machine and only correctness is checked there.
-- AVX-512 is an explicit non-goal — the hardware cannot execute it, so it cannot be tested.
+- SIMD targets AVX2. AVX-512 is available on Zen 4 but stays out of scope: it is double-pumped
+  over 256-bit datapaths there, so the gain on a bandwidth-bound kernel must be measured rather
+  than assumed, and a second SIMD path doubles the correctness surface for an unproven win.
 - The Python toolchain is required, not optional: dataset conversion (GloVe ships as HDF5) and the
   hnswlib baseline both depend on it.
 - CI runs `fmt --check`, `clippy -D warnings`, and the test suite. A recall-regression job on

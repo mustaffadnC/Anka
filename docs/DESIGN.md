@@ -312,9 +312,18 @@ and the whole server, health endpoint included, stops responding.
 
 ## 9. Development environment
 
-Host: Windows 11 with an AMD Ryzen 5 7600X (Zen 4 — AVX2, no AVX-512), 32 GB DDR5.
+Host: Windows 11 with an AMD Ryzen 5 7600X (Zen 4, 6C/12T), 32 GB DDR5.
 Development and measurement happen in **WSL2 + Ubuntu**, which is also what CI runs, so POSIX
 behaviour (`fsync`, directory `fsync`, `kill -9`, `/proc/self/status`) is the same in both.
+WSL2 gets half the host's RAM by default — 15 GiB and 12 vCPUs here, comfortably more than the
+~1.4 GB the largest datasets and their graphs need.
+
+SIMD targets **AVX2**. Zen 4 does support AVX-512 (it was AMD's first consumer architecture to
+do so, and `/proc/cpuinfo` reports `avx512f` on this machine), but no AVX-512 path is written:
+Zen 4 double-pumps it over 256-bit datapaths, so on a bandwidth-bound distance kernel any gain
+over AVX2 has to be measured rather than assumed, and a second SIMD path doubles the
+correctness surface — each one needs its own scalar-equivalence property test. It stays a
+stretch goal, and unlike most stretch goals it is one this hardware can actually validate.
 
 Layout matters under WSL2, where `/mnt/c` is markedly slower than ext4:
 
