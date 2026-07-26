@@ -15,6 +15,7 @@
 set -euo pipefail
 
 DATASETS_DIR="${ANKA_DATASETS:-$HOME/anka-datasets}"
+VENV_DIR="${ANKA_VENV:-$HOME/.venvs/anka}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHECKSUMS="$SCRIPT_DIR/checksums.txt"
 
@@ -98,10 +99,26 @@ do_sift1m() {
 # GloVe ships as HDF5 from ann-benchmarks, not as .fvecs. The reader in anka-core only
 # speaks .fvecs/.ivecs, so conversion happens here rather than in Rust: pulling in an HDF5
 # C dependency to read one file once would be a poor trade.
+# setup-wsl.sh puts numpy and h5py in a virtualenv, so the system interpreter is the wrong
+# thing to test — prefer the venv and fall back to a system Python that happens to have them.
+resolve_python() {
+  local candidate
+  for candidate in "$VENV_DIR/bin/python" python3; do
+    if command -v "$candidate" >/dev/null 2>&1 &&
+      "$candidate" -c 'import h5py, numpy' >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 do_glove() {
-  need_cmd python3
-  python3 -c 'import h5py, numpy' 2>/dev/null || die "python3 is missing h5py/numpy.
-  python3 -m venv .venv && . .venv/bin/activate && pip install h5py numpy"
+  local python
+  python="$(resolve_python)" || die "no Python with numpy and h5py available.
+Run ./scripts/setup-wsl.sh, or build one by hand:
+  python3 -m venv $VENV_DIR && $VENV_DIR/bin/pip install numpy h5py"
+  log "converting with $python"
 
   fetch "$GLOVE_URL" "$DATASETS_DIR/glove-100-angular.hdf5"
 
@@ -111,7 +128,7 @@ do_glove() {
   else
     log "converting glove-100-angular.hdf5 to .fvecs/.ivecs"
     mkdir -p "$out"
-    python3 "$SCRIPT_DIR/hdf5_to_fvecs.py" \
+    "$python" "$SCRIPT_DIR/hdf5_to_fvecs.py" \
       --input "$DATASETS_DIR/glove-100-angular.hdf5" \
       --outdir "$out" \
       --prefix glove100
