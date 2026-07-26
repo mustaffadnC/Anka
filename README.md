@@ -8,10 +8,11 @@ repositories say "I implemented HNSW". This one aims to say: *I implemented HNSW
 recall/QPS Pareto curves on SIFT1M and GloVe-100, compared them against hnswlib under
 identical parameters on identical hardware, and profiled where the difference comes from.*
 
-> **Status: under construction.** Phase 0 (skeleton + dataset loading) is in progress.
-> No performance numbers are published yet — and none will be published until they come from
-> a script anyone can re-run. See [docs/RESULTS.md](docs/RESULTS.md) for what has actually
-> been measured so far, and the roadmap below for what is coming.
+> **Status: under construction.** Phase 0 is done — the workspace, CI, dataset readers and
+> memory reporting are in place, and SIFT1M, siftsmall and GloVe-100 all load and verify.
+> No search performance numbers are published yet, and none will be until they come from a
+> script anyone can re-run. See [docs/RESULTS.md](docs/RESULTS.md) for what has actually been
+> measured, and the roadmap below for what is coming.
 
 ---
 
@@ -42,8 +43,8 @@ any claim of production readiness.
 
 | Phase | Scope | Status |
 |---|---|---|
-| 0 | Workspace, CI, `.fvecs`/`.ivecs` reader, `VectorStore` | 🚧 in progress |
-| 1 | Distance metrics (scalar + AVX2), brute force, ground truth | ⬜ |
+| 0 | Workspace, CI, `.fvecs`/`.ivecs` readers, `VectorStore` | ✅ done |
+| 1 | Distance metrics (scalar + AVX2), brute force, ground truth | 🚧 next |
 | 2 | HNSW core, `ef`/`M` sweeps, hnswlib comparison | ⬜ |
 | 3 | Snapshot, WAL, crash recovery | ⬜ |
 | — | **Benchmark showcase** — the milestone that makes this repo self-contained | ⬜ |
