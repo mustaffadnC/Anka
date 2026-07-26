@@ -13,6 +13,8 @@ stats = ["anka-core/stats"]
 
 [dependencies]
 anka-core.workspace = true
+rand = "0.10.2"
 rayon = "1.12.0"
+thiserror = "2.0.19"
 
 [dev-dependencies]

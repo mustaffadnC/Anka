@@ -8,10 +8,13 @@
 //!
 //! - [`layer`] — flat adjacency, sparse above layer 0
 //! - [`visited`] — epoch-stamped per-query membership set
+//! - [`params`] — build parameters and seeded layer assignment
 //! - search, neighbour selection and insert follow
 
 pub mod layer;
+pub mod params;
 pub mod visited;
 
 pub use layer::Layer;
+pub use params::{HnswParams, LevelGenerator, MAX_LEVEL};
 pub use visited::VisitedList;

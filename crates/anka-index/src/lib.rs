@@ -10,9 +10,11 @@
 //! produces a working-but-wrong index.
 
 pub mod brute_force;
+pub mod error;
 pub mod ground_truth;
 pub mod hnsw;
 
 pub use brute_force::{BruteForceIndex, Kernel};
+pub use error::IndexError;
 pub use ground_truth::{Agreement, DistanceAgreement};
-pub use hnsw::{Layer, VisitedList};
+pub use hnsw::{HnswParams, Layer, VisitedList};
