@@ -80,6 +80,18 @@ def main() -> int:
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--ef", default="10,20,40,80,160,320,512,800")
     ap.add_argument("--warmup", type=int, default=1000)
+    ap.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="time each ef this many times and report the median, with the spread",
+    )
+    ap.add_argument(
+        "--skip-percentiles",
+        action="store_true",
+        help="skip the per-query pass; it costs as much as the batch measurement and its numbers "
+        "are not comparable to Anka's anyway",
+    )
     ap.add_argument("--limit", type=int, default=None, help="use only the first N base vectors")
     ap.add_argument("--queries", type=int, default=None)
     args = ap.parse_args()
@@ -135,45 +147,71 @@ def main() -> int:
     measured = len(queries) - warmup
     if measured <= 0:
         sys.exit("--warmup leaves no queries to measure")
-    print(f"# {measured} queries measured, {warmup} used for warm-up")
+    repeat = max(args.repeat, 1)
+    print(f"# {measured} queries measured, {warmup} used for warm-up, {repeat} repetition(s)")
     print()
-    print(f"  {'ef':>5}  {'recall@k':>9}  {'QPS':>10}  {'p50':>9}  {'p95':>9}  {'p99':>9}")
+    header = f"  {'ef':>5}  {'recall@k':>9}  {'QPS':>10}  {'spread':>7}"
+    if not args.skip_percentiles:
+        header += f"  {'p50':>9}  {'p95':>9}  {'p99':>9}"
+    print(header)
 
     expected = truth[:measured, : args.k]
+    worst_spread = 0.0
     for ef in ef_values:
         index.set_ef(max(ef, args.k))
 
-        if warmup:
-            index.knn_query(queries[len(queries) - warmup :], k=args.k)
+        # Repetition is not optional caution. The same binary was measured 25% apart across two
+        # runs of this suite because clock behaviour on this machine is not pinned, so a single
+        # sample is not a measurement. Spec section 6 rule 4 asks for three.
+        rates = []
+        recall = 0.0
+        for _ in range(repeat):
+            if warmup:
+                index.knn_query(queries[len(queries) - warmup :], k=args.k)
 
-        # Batch call: the loop runs inside hnswlib, so what is timed is search, not the
-        # interpreter. Per-query latency is measured separately below for the percentiles.
-        start = time.perf_counter()
-        labels, _ = index.knn_query(queries[:measured], k=args.k)
-        elapsed = time.perf_counter() - start
+            # Batch call: the loop runs inside hnswlib, so what is timed is search rather than
+            # the interpreter.
+            start = time.perf_counter()
+            labels, _ = index.knn_query(queries[:measured], k=args.k)
+            elapsed = time.perf_counter() - start
+            rates.append(measured / elapsed)
 
-        hits = sum(len(np.intersect1d(labels[i], expected[i])) for i in range(measured))
-        recall = hits / (measured * args.k)
+            hits = sum(len(np.intersect1d(labels[i], expected[i])) for i in range(measured))
+            recall = hits / (measured * args.k)
 
-        # Percentiles need per-query timings, and those necessarily include Python call overhead.
-        # They are reported for shape, not to be compared against Anka's microsecond figures.
-        latencies_us = np.empty(measured, dtype=np.float64)
-        for i in range(measured):
-            t0 = time.perf_counter()
-            index.knn_query(queries[i : i + 1], k=args.k)
-            latencies_us[i] = (time.perf_counter() - t0) * 1e6
-        latencies_us.sort()
+        rates.sort()
+        median_qps = rates[len(rates) // 2]
+        spread = (rates[-1] - rates[0]) / median_qps if median_qps > 0 else 0.0
+        worst_spread = max(worst_spread, spread)
 
-        print(
-            f"  {ef:>5}  {recall:>9.4f}  {measured / elapsed:>10.1f}  "
-            f"{percentile(latencies_us, 0.50):>8.1f}µs  "
-            f"{percentile(latencies_us, 0.95):>8.1f}µs  "
-            f"{percentile(latencies_us, 0.99):>8.1f}µs"
-        )
+        row = f"  {ef:>5}  {recall:>9.4f}  {median_qps:>10.1f}  "
+        row += f"{spread * 100:>6.1f}%" if repeat > 1 else f"{'-':>7}"
+
+        if not args.skip_percentiles:
+            # Per-query timings necessarily include Python call overhead. Reported for shape only.
+            latencies_us = np.empty(measured, dtype=np.float64)
+            for i in range(measured):
+                t0 = time.perf_counter()
+                index.knn_query(queries[i : i + 1], k=args.k)
+                latencies_us[i] = (time.perf_counter() - t0) * 1e6
+            latencies_us.sort()
+            row += (
+                f"  {percentile(latencies_us, 0.50):>7.1f}µs"
+                f"  {percentile(latencies_us, 0.95):>7.1f}µs"
+                f"  {percentile(latencies_us, 0.99):>7.1f}µs"
+            )
+
+        print(row)
 
     print()
-    print("# QPS comes from the batch call. The percentiles come from single-query calls and")
-    print("# include Python overhead, so they are not comparable to Anka's directly.")
+    print("# QPS comes from the batch call, median over repetitions.")
+    if repeat > 1:
+        print(f"# widest QPS spread across repetitions: {worst_spread * 100:.1f}%")
+    else:
+        print("# single sample per ef — pass --repeat 3 for the median spec section 6 asks for.")
+    if not args.skip_percentiles:
+        print("# Percentiles come from single-query calls and include Python overhead, so they")
+        print("# are not comparable to Anka's figures.")
     return 0
 
 

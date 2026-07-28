@@ -73,6 +73,15 @@ pub struct BenchArgs {
     #[arg(long, default_value_t = 1000)]
     pub warmup: usize,
 
+    /// Times each beam size this many times and reports the median.
+    ///
+    /// Spec section 6 rule 4 asks for three repetitions. It is not optional caution: the same
+    /// binary was measured 25% apart across two runs of this suite, because clock behaviour on
+    /// this machine is not pinned. A single sample is not a measurement, so the spread is printed
+    /// alongside the median.
+    #[arg(long, default_value_t = 1)]
+    pub repeat: usize,
+
     /// Ablation: pick the nearest M candidates instead of running the heuristic.
     #[arg(long)]
     pub no_heuristic: bool,
@@ -103,6 +112,7 @@ struct SweepContext<'a> {
 }
 
 /// One row of the sweep.
+#[derive(Clone)]
 struct SweepRow {
     ef: usize,
     recall: f64,
@@ -111,6 +121,64 @@ struct SweepRow {
     p95: Duration,
     p99: Duration,
     distances_per_query: Option<f64>,
+    /// Spread of QPS across repetitions, as a fraction of the median. Zero for a single sample.
+    qps_spread: f64,
+}
+
+/// Median of each field across repetitions, with the QPS spread carried through.
+///
+/// Fields are reduced independently, which is what "report the median" means for a table of
+/// unrelated statistics. Recall must be identical across repetitions — the index and the query
+/// order are both deterministic — so a mismatch is a bug rather than noise, and it is checked
+/// instead of averaged away.
+fn median_row(mut samples: Vec<SweepRow>) -> Result<SweepRow> {
+    let first = samples
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no samples to reduce"))?;
+
+    for sample in &samples {
+        if (sample.recall - first.recall).abs() > 1e-12 {
+            bail!(
+                "recall varied across repetitions at ef={} ({} vs {}) — search is not \
+                 deterministic",
+                first.ef,
+                first.recall,
+                sample.recall
+            );
+        }
+    }
+
+    let middle = samples.len() / 2;
+
+    let mut qps: Vec<f64> = samples.iter().map(|s| s.qps).collect();
+    qps.sort_by(f64::total_cmp);
+    let median_qps = qps[middle];
+    let spread = if median_qps > 0.0 {
+        (qps[qps.len() - 1] - qps[0]) / median_qps
+    } else {
+        0.0
+    };
+
+    let median_duration = |pick: fn(&SweepRow) -> Duration| {
+        let mut values: Vec<Duration> = samples.iter().map(pick).collect();
+        values.sort_unstable();
+        values[middle]
+    };
+
+    let p50 = median_duration(|s| s.p50);
+    let p95 = median_duration(|s| s.p95);
+    let p99 = median_duration(|s| s.p99);
+
+    samples.clear();
+    Ok(SweepRow {
+        qps: median_qps,
+        p50,
+        p95,
+        p99,
+        qps_spread: spread,
+        ..first
+    })
 }
 
 pub fn run(args: BenchArgs) -> Result<()> {
@@ -267,22 +335,32 @@ fn measure<M: Metric>(
         measured,
     };
 
+    let repeat = args.repeat.max(1);
     let mut rows = Vec::new();
     for &ef in &args.ef {
-        rows.push(sweep_one::<M>(&index, &mut searcher, &context, ef)?);
+        let mut samples = Vec::with_capacity(repeat);
+        for _ in 0..repeat {
+            samples.push(sweep_one::<M>(&index, &mut searcher, &context, ef)?);
+        }
+        rows.push(median_row(samples)?);
     }
 
     println!();
     println!(
-        "  {:>5}  {:>9}  {:>10}  {:>9}  {:>9}  {:>9}  {:>12}",
-        "ef", "recall@k", "QPS", "p50", "p95", "p99", "dist/query"
+        "  {:>5}  {:>9}  {:>10}  {:>7}  {:>9}  {:>9}  {:>9}  {:>12}",
+        "ef", "recall@k", "QPS", "spread", "p50", "p95", "p99", "dist/query"
     );
     for row in &rows {
         println!(
-            "  {:>5}  {:>9.4}  {:>10.1}  {:>9}  {:>9}  {:>9}  {:>12}",
+            "  {:>5}  {:>9.4}  {:>10.1}  {:>7}  {:>9}  {:>9}  {:>9}  {:>12}",
             row.ef,
             row.recall,
             row.qps,
+            if repeat > 1 {
+                format!("{:.1}%", row.qps_spread * 100.0)
+            } else {
+                "-".to_string()
+            },
             format!("{:.1?}", row.p50),
             format!("{:.1?}", row.p95),
             format!("{:.1?}", row.p99),
@@ -291,6 +369,17 @@ fn measure<M: Metric>(
         );
     }
     println!();
+    if repeat > 1 {
+        let worst = rows.iter().map(|r| r.qps_spread).fold(0.0f64, f64::max);
+        tracing::info!(
+            "median of {repeat} repetitions; widest QPS spread across repetitions {:.1}%",
+            worst * 100.0
+        );
+    } else {
+        tracing::warn!(
+            "single sample per beam size — pass --repeat 3 for the median spec section 6 asks for"
+        );
+    }
 
     crate::report_memory();
 
@@ -362,6 +451,7 @@ fn sweep_one<M: Metric>(
         p95: percentile(&latencies, 0.95),
         p99: percentile(&latencies, 0.99),
         distances_per_query: counter.count().map(|c| c as f64 / measured as f64),
+        qps_spread: 0.0,
     })
 }
 
