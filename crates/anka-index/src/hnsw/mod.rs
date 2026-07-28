@@ -11,16 +11,19 @@
 //! - [`params`] — build parameters and seeded layer assignment
 //! - [`stats`] — distance-computation counter, behind the `stats` feature
 //! - [`search`] — Algorithm 2, beam search within one layer
-//! - neighbour selection, insert and the top-level search follow
+//! - [`select`] — Algorithm 4, the neighbour heuristic the index rests on
+//! - insert and the top-level search follow
 
 pub mod layer;
 pub mod params;
 pub mod search;
+pub mod select;
 pub mod stats;
 pub mod visited;
 
 pub use layer::Layer;
 pub use params::{HnswParams, LevelGenerator, MAX_LEVEL};
 pub use search::Searcher;
+pub use select::select_neighbors;
 pub use stats::DistanceCounter;
 pub use visited::VisitedList;
