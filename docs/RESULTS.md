@@ -356,13 +356,110 @@ stays.
 
 *pending*
 
-### Ablations
+### Ablations — SIFT1M (`M`=16, `ef_construction`=200)
 
-*pending*
+Both flags exist so this table can be produced. Both results are weaker than the spec predicted,
+and the spec has been corrected rather than the measurement explained away.
+
+| Configuration | `ef`=40 | `ef`=80 | `ef`=160 | `ef`=320 | `ef`=800 |
+|---|---|---|---|---|---|
+| Full (heuristic + keep-pruned) | 0.9372 | 0.9780 | 0.9942 | 0.9985 | 0.9993 |
+| Heuristic off (nearest-`M`) | 0.8810 | 0.9450 | 0.9776 | 0.9922 | 0.9980 |
+| Keep-pruned off | 0.9279 | 0.9744 | 0.9934 | 0.9984 | 0.9993 |
+
+#### What the heuristic is actually worth
+
+The spec said skipping `SELECT_NEIGHBORS_HEURISTIC` leaves recall "stuck in the seventies, and
+raising `ef` does not help". On SIFT1M that is not what happens: nearest-`M` still reaches 0.9980
+at `ef`=800. The curve is lower, not capped.
+
+The cost shows up as throughput at **equal recall**, which is the comparison that matters:
+
+| | recall | `ef` | QPS |
+|---|---|---|---|
+| Heuristic on | 0.9780 | 80 | **4 125** |
+| Heuristic off | 0.9776 | 160 | 2 751 |
+
+So the heuristic is worth **1.50× throughput at the same recall** on SIFT1M — a real and
+worthwhile gain, and a different claim from a recall ceiling. It also builds slower for it:
+466.8 s against 368.7 s, because candidate-to-candidate distances are the work it adds.
+
+One unexpected side effect: nearest-`M` raises the share of one-way edges from 14.91% to
+**25.75%**. The heuristic produces a markedly more symmetric graph, which was not something the
+spec anticipated in either direction.
+
+#### What keep-pruned is actually worth
+
+Here the predicted *mechanism* is exactly right and the predicted *consequence* is not. Turning
+the refill off thins the graph precisely where the spec said it would:
+
+| Layer | Mean degree, on | Mean degree, off |
+|---|---|---|
+| 0 | 25.69 | 21.11 |
+| 1 | 16.00 | 13.75 |
+| 2 | 16.00 | 12.21 |
+| 3 | 16.00 | 9.43 |
+| 4 | 11.00 | 4.33 |
+
+Total edges fall from 26.8 M to 22.0 M, 17.7% fewer, and the effect grows with layer height — the
+upper layers are where candidates get pruned hardest and where the refill matters most.
+
+But recall barely moves: 0.9 points at `ef`=40, 0.4 at `ef`=80, 0.08 at `ef`=160. And a thinner
+graph is cheaper to traverse, so at `ef`=80 the ablated index gives 4 597 QPS at 0.9744 against
+4 125 QPS at 0.9780 — the two sit on essentially the same recall/QPS frontier on this dataset.
+
+`keep_pruned` stays on as the default: it costs nothing measurable in throughput and it keeps the
+graph closer to what the paper describes. But calling it a recall requirement, as the spec did,
+overstates it on SIFT1M.
+
+#### Why these are not the last word
+
+Both spec claims are about *clustered* data, and SIFT1M is not strongly clustered — which is the
+reason the project measures GloVe-100 at all. The ablations on GloVe are the ones that can support
+or refute the original claims, and correcting the spec on SIFT evidence alone would repeat exactly
+the mistake this project is meant to avoid.
+
+**GloVe-100 ablations:** *pending*
 
 ### Distance computations
 
-*pending*
+From a `--features stats` build. **The QPS in this run is not comparable to the tables above** —
+not because of the counter, but because these runs measured 1 000 queries where the others measured
+9 000, and a smaller query set keeps more of the graph in cache. The instrumented run actually
+reports *higher* QPS (5 291 against 4 125 at `ef`=80) for that reason alone, which is a useful
+reminder that a throughput number without its conditions is not a measurement.
+
+**SIFT1M**, 1 000 000 vectors — a brute-force query costs 1 000 000 distance computations:
+
+| `ef` | recall@10 | Distances / query | Reduction vs brute force |
+|---|---|---|---|
+| 10 | 0.7226 | 422 | 2 370× |
+| 80 | 0.9752 | 1 641 | **609×** |
+| 160 | 0.9933 | 2 843 | 352× |
+| 800 | 0.9993 | 10 176 | 98× |
+
+**GloVe-100**, 1 183 514 vectors:
+
+| `ef` | recall@10 | Distances / query | Reduction vs brute force |
+|---|---|---|---|
+| 80 | 0.7940 | 2 002 | 591× |
+| 320 | 0.9043 | 6 126 | 193× |
+| 800 | 0.9507 | 13 519 | 88× |
+
+**This is what phase 1 was pointing at.** A brute-force scan over SIFT1M runs at 49.4 GB/s, which
+is this machine's DDR5 ceiling: the kernel is waiting on memory, so no amount of work on it can
+help. The index does not compute distances faster — it computes **609× fewer of them** to reach
+recall 0.975. That is the entire mechanism, and it is why `distance_computations` is the primary
+metric for this phase rather than a diagnostic.
+
+It also puts a number on how much harder GloVe is. To clear its 0.90 target GloVe needs 6 126
+distance computations per query; SIFT1M passes 0.975 with 1 641. Same `M`, same
+`ef_construction`, 3.7× the work for a lower recall.
+
+Construction cost, same build: **5 255 distance computations per vector** on SIFT1M and **7 686**
+on GloVe — 5.25 G and 9.10 G in total. Build time tracks it closely (394.6 s and 632.4 s in the
+instrumented build), which is the expected result and the reason build time is not reported
+separately as an independent finding.
 
 ### hnswlib comparison
 
