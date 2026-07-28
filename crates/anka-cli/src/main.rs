@@ -17,6 +17,8 @@ use anka_index::ground_truth::{self, Agreement, DistanceAgreement};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
+mod bench;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "anka",
@@ -34,6 +36,8 @@ enum Command {
     Load(LoadArgs),
     /// Compute exact ground truth and check it against the dataset's published list.
     Gt(GroundTruthArgs),
+    /// Build an HNSW index, then sweep `ef` measuring recall and throughput.
+    Bench(bench::BenchArgs),
 }
 
 #[derive(Args, Debug)]
@@ -81,14 +85,17 @@ struct GroundTruthArgs {
 /// The expected counts are asserted, not merely printed. Phase 0's definition of done is that
 /// SIFT1M loads as exactly 1 000 000 x 128; a loader that quietly accepted 999 999 would
 /// invalidate every recall figure measured on top of it.
-struct DatasetSpec {
-    dir: &'static str,
-    prefix: &'static str,
-    dim: usize,
-    base: usize,
-    queries: usize,
-    neighbours: usize,
-    metric: MetricKind,
+pub(crate) struct DatasetSpec {
+    pub dir: &'static str,
+    pub prefix: &'static str,
+    pub dim: usize,
+    pub base: usize,
+    pub queries: usize,
+    pub neighbours: usize,
+    pub metric: MetricKind,
+    /// `recall@10` the phase 2 definition of done requires on this dataset, where the spec sets
+    /// one. Checked by `anka bench` rather than left to be eyeballed off a table.
+    pub recall_target: Option<f64>,
 }
 
 const SIFTSMALL: DatasetSpec = DatasetSpec {
@@ -99,6 +106,9 @@ const SIFTSMALL: DatasetSpec = DatasetSpec {
     queries: 100,
     neighbours: 100,
     metric: MetricKind::L2Squared,
+    // Not a spec threshold: 10 000 points with M=16 should be effectively exact, so anything
+    // below this means something is broken rather than merely approximate.
+    recall_target: Some(0.99),
 };
 
 const SIFT1M: DatasetSpec = DatasetSpec {
@@ -109,6 +119,7 @@ const SIFT1M: DatasetSpec = DatasetSpec {
     queries: 10_000,
     neighbours: 100,
     metric: MetricKind::L2Squared,
+    recall_target: Some(0.95),
 };
 
 const GLOVE100: DatasetSpec = DatasetSpec {
@@ -119,6 +130,9 @@ const GLOVE100: DatasetSpec = DatasetSpec {
     queries: 10_000,
     neighbours: 100,
     metric: MetricKind::Cosine,
+    // Lower than SIFT on purpose: GloVe is where graph methods separate, and the spec sets the
+    // bar accordingly.
+    recall_target: Some(0.90),
 };
 
 fn main() -> Result<()> {
@@ -126,6 +140,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Load(args) => load(args),
         Command::Gt(args) => check_ground_truth(args),
+        Command::Bench(args) => bench::run(args),
     }
 }
 
@@ -427,7 +442,7 @@ fn report_equivalence(agreement: &DistanceAgreement, rtol: f64) {
 // shared helpers
 // ---------------------------------------------------------------------------------------------
 
-fn spec_for(name: &str) -> Result<&'static DatasetSpec> {
+pub(crate) fn spec_for(name: &str) -> Result<&'static DatasetSpec> {
     Ok(match name {
         "siftsmall" => &SIFTSMALL,
         "sift1m" | "sift" => &SIFT1M,
@@ -436,7 +451,11 @@ fn spec_for(name: &str) -> Result<&'static DatasetSpec> {
     })
 }
 
-fn dataset_dir(name: &str, spec: &DatasetSpec, explicit: Option<PathBuf>) -> Result<PathBuf> {
+pub(crate) fn dataset_dir(
+    name: &str,
+    spec: &DatasetSpec,
+    explicit: Option<PathBuf>,
+) -> Result<PathBuf> {
     let dir = resolve_root(explicit)?.join(spec.dir);
     if !dir.is_dir() {
         bail!(
@@ -457,7 +476,7 @@ fn resolve_root(explicit: Option<PathBuf>) -> Result<PathBuf> {
     Ok(PathBuf::from(home).join("anka-datasets"))
 }
 
-fn take_vectors(store: &VectorStore, count: usize) -> Result<VectorStore> {
+pub(crate) fn take_vectors(store: &VectorStore, count: usize) -> Result<VectorStore> {
     let dim = store.dim();
     Ok(VectorStore::from_flat(
         dim,
@@ -465,7 +484,7 @@ fn take_vectors(store: &VectorStore, count: usize) -> Result<VectorStore> {
     )?)
 }
 
-fn take_rows(matrix: &IntMatrix, count: usize) -> Result<IntMatrix> {
+pub(crate) fn take_rows(matrix: &IntMatrix, count: usize) -> Result<IntMatrix> {
     let dim = matrix.dim();
     Ok(IntMatrix::new(
         dim,
@@ -500,7 +519,7 @@ fn report(what: &str, rows: usize, columns: usize, bytes: usize, elapsed: Durati
     );
 }
 
-fn report_memory() {
+pub(crate) fn report_memory() {
     match mem::resident_set_size() {
         Some(usage) => tracing::info!(
             "resident set size: {} (peak {})",
