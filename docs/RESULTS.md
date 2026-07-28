@@ -255,23 +255,114 @@ that measurement arrives in phase 2.
 
 ## 3. Phase 2 — HNSW
 
-### recall/QPS Pareto — SIFT1M (`M=16, ef_construction=200`)
+All figures single-threaded, `RUSTFLAGS="-C target-cpu=native"`, 9 000 queries measured with
+1 000 tail queries used for warm-up, recall against each dataset's published ground truth.
 
-| `ef` | recall@10 | QPS | p50 (µs) | p95 (µs) | p99 (µs) |
+### recall/QPS Pareto — SIFT1M (`M=16`, `ef_construction=200`, seed 0)
+
+| `ef` | recall@10 | QPS | p50 | p95 | p99 |
 |---|---|---|---|---|---|
-| *pending* | | | | | |
+| 10 | 0.7409 | 19 306 | 46.8 µs | 81.1 µs | 141.0 µs |
+| 20 | 0.8585 | 11 772 | 78.3 µs | 128.0 µs | 223.3 µs |
+| 40 | 0.9372 | 7 511 | 125.3 µs | 195.5 µs | 280.6 µs |
+| **80** | **0.9780** | **4 125** | 231.5 µs | 354.3 µs | 461.0 µs |
+| 160 | 0.9942 | 2 239 | 432.5 µs | 638.6 µs | 813.6 µs |
+| 320 | 0.9985 | 1 192 | 825.5 µs | 1.2 ms | 1.4 ms |
+| 512 | 0.9992 | 813 | 1.2 ms | 1.7 ms | 1.9 ms |
+| 800 | 0.9993 | 547 | 1.8 ms | 2.5 ms | 2.8 ms |
 
-### recall/QPS Pareto — GloVe-100 (cosine)
+**H1 met:** the target is `recall@10 ≥ 0.95`, reached between `ef` 40 and 80 and comfortably clear
+at 80. Build: 466.8 s, 2 142 vectors/s, single-threaded. Peak RSS 1.1 GiB (the base set is held
+alongside the index for ground-truth comparison, so the index itself accounts for roughly half).
 
-| `ef` | recall@10 | QPS | p50 (µs) | p95 (µs) | p99 (µs) |
+### recall/QPS Pareto — GloVe-100 (cosine, `M=16`, `ef_construction=200`)
+
+| `ef` | recall@10 | QPS | p50 | p95 | p99 |
 |---|---|---|---|---|---|
-| *pending* | | | | | |
+| 10 | 0.4827 | 13 512 | 64.8 µs | 130.4 µs | 216.5 µs |
+| 20 | 0.6043 | 9 028 | 97.2 µs | 196.3 µs | 332.1 µs |
+| 40 | 0.7068 | 5 950 | 150.3 µs | 291.2 µs | 446.7 µs |
+| 80 | 0.7915 | 3 447 | 263.4 µs | 478.9 µs | 720.1 µs |
+| 160 | 0.8535 | 1 910 | 478.0 µs | 850.8 µs | 1.2 ms |
+| **320** | **0.9000** | **1 015** | 922.8 µs | 1.6 ms | 2.1 ms |
+| 512 | 0.9270 | 769 | 1.3 ms | 1.9 ms | 2.2 ms |
+| 800 | 0.9469 | 501 | 2.0 ms | 2.8 ms | 3.3 ms |
 
-### `M` sweep
+**H5's cosine target met:** `recall@10 ≥ 0.90`, reached at `ef = 320`. Build: 610.2 s,
+1 939 vectors/s.
 
-| `M` | recall@10 | Graph memory | Build time |
+**GloVe is the harder dataset, and by a wide margin.** At `ef = 160` SIFT1M is at 0.9942 while
+GloVe is at 0.8535; GloVe needs `ef = 320` to clear 0.90, which SIFT1M passes at roughly `ef = 50`.
+This is the whole reason the spec insists on measuring both — on SIFT alone almost any
+implementation looks good.
+
+It also settles a spec correction made before any of this was built. The original `ef` sweep
+stopped at 320, and GloVe reaches 0.9000 *exactly* at 320. Had the sweep not been extended to 512
+and 800, the phase would have passed its own threshold with zero headroom and no way to see
+whether the curve was still climbing. It is: 0.9469 at `ef = 800`.
+
+### `M` sweep — SIFT1M
+
+| `M` | Build | Graph | Bytes/vector | Layers | `ef` for ≥ 0.95 | recall @ `ef`=80 | QPS @ `ef`=80 |
+|---|---|---|---|---|---|---|---|
+| 8 | 295.6 s (3 383/s) | 95.3 MiB | 100.0 | 6 | ~120 | 0.9202 | 6 928 |
+| 16 | 466.8 s (2 142/s) | 152.2 MiB | 159.6 | 5 | ~55 | 0.9780 | 4 125 |
+| 32 | 734.4 s (1 362/s) | 266.7 MiB | 279.7 | 4 | < 40 | 0.9930 | 2 633 |
+
+Read at a *fixed* `ef` the table says larger `M` is slower, which is the wrong way to read it.
+At **equal recall** the ordering reverses:
+
+| Target | `M`=8 | `M`=16 | `M`=32 |
 |---|---|---|---|
-| *pending* | | | |
+| recall ≈ 0.99 | 1 926 QPS (`ef`=320, 0.9887) | 2 239 QPS (`ef`=160, 0.9942) | **2 633 QPS** (`ef`=80, 0.9930) |
+| Graph memory | 95.3 MiB | 152.2 MiB | 266.7 MiB |
+
+So `M` buys speed at high recall with memory, and 2.8× the graph for 1.37× the throughput. `M`=16
+is the reasonable middle and is what every other measurement here uses. `M`=32 cannot reach *low*
+recall at all — at its narrowest usable beam it is already at 0.9751.
+
+### Graph structure
+
+| | SIFT1M `M`=8 | SIFT1M `M`=16 | SIFT1M `M`=32 | GloVe `M`=16 |
+|---|---|---|---|---|
+| Layers | 6 | 5 | 4 | 5 |
+| Layer 0 mean degree / cap | 12.71 / 16 | 25.69 / 32 | 50.84 / 64 | 24.79 / 32 |
+| Layer 0 saturation | 79.4% | 80.3% | 79.4% | 77.5% |
+| Isolated nodes, any layer | 0 | 0 | 0 | 0 |
+| One-way edges | 17.33% | 14.91% | 18.66% | 18.97% |
+| Graph memory | 95.3 MiB | 152.2 MiB | 266.7 MiB | 180.3 MiB |
+
+Three things worth noting.
+
+**The level distribution matches theory on real data.** Layer assignment should give
+`P(level ≥ l) = M^-l`. Measured on SIFT1M at `M`=16, layer occupancy is 1 000 000 / 62 480 / 3 987 /
+244 / 12 — that is 6.248% / 0.3987% / 0.0244% / 0.0012% against predicted 6.25% / 0.391% /
+0.0244% / 0.0015%. Layer count also falls as `M` rises (6 → 5 → 4), which follows from
+`mL = 1/ln(M)`.
+
+**Layer 0 settles at ~80% of its cap** across every `M` and both datasets. That is the pruning
+step working: degree grows until re-selection starts trimming, and finds an equilibrium rather
+than pinning at the cap or drifting below it.
+
+**The sparse upper-layer design paid for itself, and its floor is visible.** Layer 0 on SIFT1M at
+`M`=16 costs 125.9 MiB, which is exactly `1M × (32+1) × 4` bytes. The four layers above it cost
+25.3 MiB together; storing them densely would have cost about 272 MiB. But the floor shows up at
+the top: layer 4 holds **12 nodes** and costs 5.0 MiB, because the `NodeId → slot` table is one
+`u32` per node in the index regardless of how few of them the layer holds. A hash map would be
+cheaper there and slower in the traversal loop; at 25 MiB out of a 640 MiB index the dense table
+stays.
+
+### hnswlib comparison
+
+*pending*
+
+### Ablations
+
+*pending*
+
+### Distance computations
+
+*pending*
 
 ### hnswlib comparison
 

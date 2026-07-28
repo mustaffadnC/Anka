@@ -40,9 +40,37 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-features
 
-  # Added in phase 2: builds a small index on `siftsmall` and fails the build if
-  # recall@10 drops below the threshold. Correctness regression, not a perf gate.
+  # Builds an index on real data and fails if recall@10 falls below the threshold. A correctness
+  # gate, not a performance one: no target-cpu=native, and no timing is asserted, because the
+  # runner is not the benchmark machine.
   #
-  # recall-regression:
-  #   runs-on: ubuntu-latest
-  #   ...
+  # The workspace tests already contain a deterministic recall check on synthetic data, which
+  # needs no network. This job adds real vectors on top — siftsmall is 10 MB and cached, so the
+  # download happens once per key.
+  recall-regression:
+    name: recall regression (siftsmall)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache siftsmall
+        id: dataset
+        uses: actions/cache@v4
+        with:
+          path: ~/anka-datasets/siftsmall
+          key: siftsmall-${{ hashFiles('scripts/checksums.txt') }}
+
+      - name: Download siftsmall
+        if: steps.dataset.outputs.cache-hit != 'true'
+        run: ./scripts/download_datasets.sh siftsmall
+
+      # `anka bench` carries the per-dataset recall target and exits non-zero when it is missed,
+      # so the gate lives with the data rather than in a threshold repeated here.
+      - name: Recall regression
+        run: cargo run --release -p anka-cli -- bench siftsmall --ef 40 --k 10
