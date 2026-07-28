@@ -17,4 +17,4 @@ pub mod hnsw;
 pub use brute_force::{BruteForceIndex, Kernel};
 pub use error::IndexError;
 pub use ground_truth::{Agreement, DistanceAgreement};
-pub use hnsw::{HnswParams, Layer, VisitedList};
+pub use hnsw::{DistanceCounter, HnswParams, Layer, Searcher, VisitedList};
