@@ -270,6 +270,23 @@ A `distance_computations` counter distinguishes algorithmic wins from micro-opti
 sits in the hottest loop, so it lives behind `#[cfg(feature = "stats")]`. Distance counts and
 QPS come from different runs, and RESULTS.md says so wherever both appear.
 
+### The graph is directed
+
+Insert adds edges in both directions, so it is natural to write down "every edge is bidirectional"
+as an invariant. It is not one. The pruning step that follows re-selects a saturated neighbour's
+list through the heuristic, and that re-selection can drop the edge back to the node which just
+arrived while the forward edge remains. hnswlib's graph is directed for the same reason.
+
+Measured on siftsmall with `M = 16`, `ef_construction = 200`: **41 753 of 268 867 edges are
+one-way, 15.53%** — with every other invariant holding on the same index.
+
+Asymmetry is therefore reported by `graph_stats()` rather than asserted by `validate()`, and the
+distinction matters beyond tidiness: asserting it would fail on a correct implementation and send
+you hunting for a bug that does not exist. `validate()` covers only what the algorithm guarantees —
+degree within `Mmax(lc)`, contiguous layer membership in both directions, the entry point on the
+top layer, no self-loops or duplicate neighbours, every neighbour present on the same layer, and
+nothing isolated on layer 0.
+
 ## 7. Deletion and filtering (phase 4)
 
 Deletion uses tombstones: the `NodeId` goes into a roaring bitmap and is filtered out of
