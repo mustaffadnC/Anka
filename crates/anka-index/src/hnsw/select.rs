@@ -24,6 +24,40 @@ use anka_core::{Candidate, Metric, NodeId, VectorStore};
 use crate::hnsw::search::vector_at;
 use crate::hnsw::stats::DistanceCounter;
 
+/// How neighbours are chosen.
+///
+/// Both fields exist because the phase 2 definition of done requires measuring what each one is
+/// worth, not asserting it. An ablation you cannot run is an opinion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionPolicy {
+    /// Algorithm 4 when true, plain nearest-`m` when false.
+    ///
+    /// False is not a usable configuration — it is the control case that shows what the
+    /// heuristic buys.
+    pub heuristic: bool,
+    /// Whether pruned candidates are added back to reach `m`.
+    pub keep_pruned: bool,
+}
+
+impl Default for SelectionPolicy {
+    fn default() -> Self {
+        Self {
+            heuristic: true,
+            keep_pruned: true,
+        }
+    }
+}
+
+impl SelectionPolicy {
+    /// The control case: nearest-`m`, no heuristic.
+    pub fn naive() -> Self {
+        Self {
+            heuristic: false,
+            keep_pruned: false,
+        }
+    }
+}
+
 /// Picks up to `m` neighbours out of `candidates`.
 ///
 /// `candidates` is sorted in place, nearest first — a slice rather than a `Vec` because nothing
@@ -37,7 +71,7 @@ pub fn select_neighbors<M: Metric>(
     vectors: &VectorStore,
     candidates: &mut [Candidate],
     m: usize,
-    keep_pruned: bool,
+    policy: SelectionPolicy,
     counter: &mut DistanceCounter,
 ) -> Vec<NodeId> {
     if m == 0 {
@@ -46,6 +80,12 @@ pub fn select_neighbors<M: Metric>(
 
     // Nearest first, ties by id, so the whole procedure is deterministic.
     candidates.sort_unstable();
+
+    if !policy.heuristic {
+        // The control case. Kept in the same function so the ablation differs by one flag and
+        // cannot drift away from the real path.
+        return candidates.iter().take(m).map(|c| c.id).collect();
+    }
 
     let data = vectors.as_slice();
     let dim = vectors.dim();
@@ -76,7 +116,7 @@ pub fn select_neighbors<M: Metric>(
         }
     }
 
-    if keep_pruned {
+    if policy.keep_pruned {
         // `pruned` is already nearest-first, so the refill takes the best of what was dropped.
         for id in pruned {
             if selected.len() >= m {
@@ -94,6 +134,14 @@ mod tests {
     use anka_core::L2Squared;
 
     use super::*;
+
+    /// The heuristic without the refill, so a short result is visible rather than topped up.
+    fn no_refill() -> SelectionPolicy {
+        SelectionPolicy {
+            heuristic: true,
+            keep_pruned: false,
+        }
+    }
 
     /// Four points around the origin: three strung out along +x at 1.0, 1.05 and 1.1, and one off
     /// at (0, 1.2) in a different direction and slightly further away.
@@ -129,7 +177,7 @@ mod tests {
         let mut counter = DistanceCounter::new();
 
         let selected =
-            select_neighbors::<L2Squared>(&store, &mut candidates, 2, false, &mut counter);
+            select_neighbors::<L2Squared>(&store, &mut candidates, 2, no_refill(), &mut counter);
 
         assert_eq!(
             selected,
@@ -138,14 +186,55 @@ mod tests {
         );
     }
 
-    /// What the naive alternative would have produced, asserted so the difference is on the
-    /// record rather than described.
+    /// The control case, so the difference is on the record rather than described. This is the
+    /// ablation the phase 2 definition of done asks for, reachable by one flag.
     #[test]
-    fn the_naive_choice_would_have_been_the_two_nearest() {
-        let (_store, mut candidates) = clustered();
-        candidates.sort_unstable();
-        let naive: Vec<NodeId> = candidates.iter().take(2).map(|c| c.id).collect();
-        assert_eq!(naive, vec![0, 1]);
+    fn the_naive_policy_takes_the_two_nearest() {
+        let (store, mut candidates) = clustered();
+        let mut counter = DistanceCounter::new();
+
+        let naive = select_neighbors::<L2Squared>(
+            &store,
+            &mut candidates,
+            2,
+            SelectionPolicy::naive(),
+            &mut counter,
+        );
+        assert_eq!(
+            naive,
+            vec![0, 1],
+            "nearest-m piles both picks into the same direction"
+        );
+    }
+
+    /// The naive path computes no candidate-to-candidate distances at all — that cost is exactly
+    /// what the heuristic pays for its diversity.
+    #[test]
+    fn the_naive_policy_computes_no_extra_distances() {
+        let (store, mut candidates) = clustered();
+
+        let mut naive_counter = DistanceCounter::new();
+        select_neighbors::<L2Squared>(
+            &store,
+            &mut candidates,
+            3,
+            SelectionPolicy::naive(),
+            &mut naive_counter,
+        );
+
+        let mut heuristic_counter = DistanceCounter::new();
+        select_neighbors::<L2Squared>(
+            &store,
+            &mut candidates,
+            3,
+            SelectionPolicy::default(),
+            &mut heuristic_counter,
+        );
+
+        if let (Some(naive), Some(heuristic)) = (naive_counter.count(), heuristic_counter.count()) {
+            assert_eq!(naive, 0);
+            assert!(heuristic > 0);
+        }
     }
 
     /// With `keep_pruned` the list is topped back up to `m` from the discarded candidates, so
@@ -155,7 +244,13 @@ mod tests {
         let (store, mut candidates) = clustered();
         let mut counter = DistanceCounter::new();
 
-        let kept = select_neighbors::<L2Squared>(&store, &mut candidates, 3, true, &mut counter);
+        let kept = select_neighbors::<L2Squared>(
+            &store,
+            &mut candidates,
+            3,
+            SelectionPolicy::default(),
+            &mut counter,
+        );
         assert_eq!(
             kept,
             vec![0, 3, 1],
@@ -163,7 +258,7 @@ mod tests {
         );
 
         let dropped =
-            select_neighbors::<L2Squared>(&store, &mut candidates, 3, false, &mut counter);
+            select_neighbors::<L2Squared>(&store, &mut candidates, 3, no_refill(), &mut counter);
         assert_eq!(dropped, vec![0, 3], "without the flag the list stays short");
     }
 
@@ -172,7 +267,7 @@ mod tests {
         let (store, mut candidates) = clustered();
         let mut counter = DistanceCounter::new();
         let selected =
-            select_neighbors::<L2Squared>(&store, &mut candidates, 1, false, &mut counter);
+            select_neighbors::<L2Squared>(&store, &mut candidates, 1, no_refill(), &mut counter);
         assert_eq!(selected, vec![0]);
     }
 
@@ -181,8 +276,14 @@ mod tests {
         let (store, mut candidates) = clustered();
         let mut counter = DistanceCounter::new();
         assert!(
-            select_neighbors::<L2Squared>(&store, &mut candidates, 0, true, &mut counter)
-                .is_empty()
+            select_neighbors::<L2Squared>(
+                &store,
+                &mut candidates,
+                0,
+                SelectionPolicy::default(),
+                &mut counter
+            )
+            .is_empty()
         );
     }
 
@@ -192,7 +293,14 @@ mod tests {
         let mut empty = Vec::new();
         let mut counter = DistanceCounter::new();
         assert!(
-            select_neighbors::<L2Squared>(&store, &mut empty, 8, true, &mut counter).is_empty()
+            select_neighbors::<L2Squared>(
+                &store,
+                &mut empty,
+                8,
+                SelectionPolicy::default(),
+                &mut counter
+            )
+            .is_empty()
         );
     }
 
@@ -200,8 +308,13 @@ mod tests {
     fn fewer_candidates_than_m_returns_all_of_them() {
         let (store, mut candidates) = clustered();
         let mut counter = DistanceCounter::new();
-        let selected =
-            select_neighbors::<L2Squared>(&store, &mut candidates, 10, true, &mut counter);
+        let selected = select_neighbors::<L2Squared>(
+            &store,
+            &mut candidates,
+            10,
+            SelectionPolicy::default(),
+            &mut counter,
+        );
         assert_eq!(selected.len(), 4);
         let mut sorted = selected.clone();
         sorted.sort_unstable();
@@ -232,7 +345,7 @@ mod tests {
         let mut counter = DistanceCounter::new();
 
         let selected =
-            select_neighbors::<L2Squared>(&store, &mut candidates, 3, false, &mut counter);
+            select_neighbors::<L2Squared>(&store, &mut candidates, 3, no_refill(), &mut counter);
         assert_eq!(selected, vec![0, 1, 2]);
     }
 
@@ -248,11 +361,16 @@ mod tests {
         let mut counter = DistanceCounter::new();
 
         let selected =
-            select_neighbors::<L2Squared>(&store, &mut candidates, 3, false, &mut counter);
+            select_neighbors::<L2Squared>(&store, &mut candidates, 3, no_refill(), &mut counter);
         assert_eq!(selected, vec![0], "co-located points add no reachability");
 
-        let refilled =
-            select_neighbors::<L2Squared>(&store, &mut candidates, 3, true, &mut counter);
+        let refilled = select_neighbors::<L2Squared>(
+            &store,
+            &mut candidates,
+            3,
+            SelectionPolicy::default(),
+            &mut counter,
+        );
         assert_eq!(refilled, vec![0, 1, 2]);
     }
 
@@ -265,8 +383,20 @@ mod tests {
         let mut forward = candidates.clone();
         let mut backward: Vec<Candidate> = candidates.into_iter().rev().collect();
 
-        let a = select_neighbors::<L2Squared>(&store, &mut forward, 3, true, &mut counter);
-        let b = select_neighbors::<L2Squared>(&store, &mut backward, 3, true, &mut counter);
+        let a = select_neighbors::<L2Squared>(
+            &store,
+            &mut forward,
+            3,
+            SelectionPolicy::default(),
+            &mut counter,
+        );
+        let b = select_neighbors::<L2Squared>(
+            &store,
+            &mut backward,
+            3,
+            SelectionPolicy::default(),
+            &mut counter,
+        );
         assert_eq!(a, b);
     }
 }

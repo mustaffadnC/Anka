@@ -5,6 +5,7 @@
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 
 use crate::error::{IndexError, MAX_M};
+use crate::hnsw::select::SelectionPolicy;
 
 /// Upper bound on the level a node can be assigned.
 ///
@@ -26,6 +27,9 @@ pub struct HnswParams {
     ef_construction: usize,
     /// Seed for layer assignment. Fixed by default — see `docs/DESIGN.md`, section 11.
     seed: u64,
+    /// How neighbours are chosen. Configurable so the ablations the phase 2 DoD requires can be
+    /// run by changing a flag rather than by editing the algorithm.
+    selection: SelectionPolicy,
     /// `mL` in the paper: `1 / ln(M)`, which makes `P(level ≥ l) = M^-l`.
     level_multiplier: f64,
 }
@@ -45,9 +49,17 @@ impl HnswParams {
             max_degree0: 2 * m,
             ef_construction: 200,
             seed: 0,
+            selection: SelectionPolicy::default(),
             level_multiplier: 0.0,
         }
         .finish()
+    }
+
+    /// Overrides the neighbour-selection policy. Used for the heuristic and keep-pruned
+    /// ablations; the default is what every published measurement uses.
+    pub fn with_selection(mut self, selection: SelectionPolicy) -> Result<Self, IndexError> {
+        self.selection = selection;
+        self.finish()
     }
 
     pub fn with_max_degree0(mut self, max_degree0: usize) -> Result<Self, IndexError> {
@@ -110,6 +122,10 @@ impl HnswParams {
 
     pub fn level_multiplier(&self) -> f64 {
         self.level_multiplier
+    }
+
+    pub fn selection(&self) -> SelectionPolicy {
+        self.selection
     }
 
     /// `Mmax(lc)` from the paper: layer 0 gets `max_degree0`, every layer above it gets `M`.

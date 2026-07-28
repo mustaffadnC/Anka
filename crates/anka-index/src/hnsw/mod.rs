@@ -12,8 +12,9 @@
 //! - [`stats`] — distance-computation counter, behind the `stats` feature
 //! - [`search`] — Algorithm 2, beam search within one layer
 //! - [`select`] — Algorithm 4, the neighbour heuristic the index rests on
-//! - insert and the top-level search follow
+//! - [`index`] — Algorithms 1 and 5: insert, with pruning, and the layered search
 
+pub mod index;
 pub mod layer;
 pub mod params;
 pub mod search;
@@ -21,9 +22,10 @@ pub mod select;
 pub mod stats;
 pub mod visited;
 
+pub use index::HnswIndex;
 pub use layer::Layer;
 pub use params::{HnswParams, LevelGenerator, MAX_LEVEL};
 pub use search::Searcher;
-pub use select::select_neighbors;
+pub use select::{SelectionPolicy, select_neighbors};
 pub use stats::DistanceCounter;
 pub use visited::VisitedList;
