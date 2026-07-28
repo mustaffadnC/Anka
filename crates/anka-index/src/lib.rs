@@ -18,5 +18,6 @@ pub use brute_force::{BruteForceIndex, Kernel};
 pub use error::IndexError;
 pub use ground_truth::{Agreement, DistanceAgreement};
 pub use hnsw::{
-    DistanceCounter, HnswIndex, HnswParams, Layer, Searcher, SelectionPolicy, VisitedList,
+    DistanceCounter, GraphStats, GraphViolation, HnswIndex, HnswParams, Layer, LayerStats,
+    Searcher, SelectionPolicy, VisitedList,
 };
