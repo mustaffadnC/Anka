@@ -248,13 +248,19 @@ Implementation follows Malkov & Yashunin (arXiv:1603.09320), algorithms 1–5. P
 
 Points where a straightforward reading of the paper produces a working-but-wrong index:
 
-- **`SELECT_NEIGHBORS_HEURISTIC` (algorithm 4) is not optional.** Taking the nearest `M`
-  candidates builds a graph in which every edge is short-range, no bridge survives between
-  distant clusters, and greedy search gets stuck in local minima. The heuristic keeps a
-  candidate only if it is closer to the query than to every already-selected neighbour —
-  note that the comparison is `dist(e, q)` against `dist(e, r)`, not against `dist(r, q)`.
-  `keepPrunedConnections` is enabled so degree does not fall below `M`; `extendCandidates` is
-  not, because it slows construction considerably for little gain.
+- **`SELECT_NEIGHBORS_HEURISTIC` (algorithm 4) is where most of the graph quality comes from.**
+  Taking the nearest `M` candidates builds a graph in which every edge is short-range and few
+  bridges survive between distant clusters, so greedy descent has to walk further for the same
+  answer. The heuristic keeps a candidate only if it is closer to the query than to every
+  already-selected neighbour — note the comparison is `dist(e, q)` against `dist(e, r)`, not
+  against `dist(r, q)`. Measured worth at equal recall: **1.50× throughput on SIFT1M, 2.30× on
+  GloVe-100**, and it halves the share of one-way edges. It is not a correctness requirement
+  though — without it recall still reaches 0.9980 on SIFT1M and 0.9050 on GloVe; the curve shifts
+  right by roughly 2.5× in `ef`. Both flags stay configurable so those numbers can be reproduced.
+  `keepPrunedConnections` is enabled — it keeps degree from falling below `M`, which it measurably
+  does, though the recall cost of losing it turns out to be ≤ 0.9 points. `extendCandidates` is
+  not enabled: it slows construction considerably for a gain the paper reports mainly on clustered
+  data.
 - **The pruning step inside insert is not optional either.** After adding bidirectional edges,
   every affected neighbour whose degree now exceeds `Mmax(lc)` must be re-selected through the
   same heuristic. Skip it and degree grows without bound as construction proceeds.

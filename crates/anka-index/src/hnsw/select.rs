@@ -1,14 +1,30 @@
 //! Algorithm 4: neighbour selection.
 //!
-//! **This is the part that decides whether the index works at all.** Taking the nearest `M`
-//! candidates builds a graph that passes every structural check and searches badly: every edge is
-//! short-range, no bridge survives between distant clusters, and greedy descent settles into
-//! local minima it cannot climb out of. Recall stalls in the seventies and raising `ef` does not
-//! help, because the beam is exploring a neighbourhood that has no route to the answer.
+//! Taking the nearest `M` candidates instead builds a graph where every edge is short-range and
+//! few bridges survive between distant clusters, so greedy descent has to walk further to reach
+//! the same answer.
 //!
 //! The heuristic keeps a candidate only when it is closer to the query than to anything already
 //! selected. That one condition spreads the chosen neighbours across directions and preserves the
 //! long edges, which is what produces the "express lane" effect the paper borrows from skip lists.
+//!
+//! **What it is worth, measured** (`docs/RESULTS.md`, section 3) — at equal recall, single
+//! threaded, median of three runs:
+//!
+//! | Dataset | Throughput with the heuristic | One-way edges |
+//! |---|---|---|
+//! | SIFT1M | 1.50× | 14.91% vs 25.75% without |
+//! | GloVe-100 | 2.30× | 18.97% vs 34.64% without |
+//!
+//! Worth noting what this is *not*. An earlier draft of this comment said recall "stalls in the
+//! seventies and raising `ef` does not help". That is wrong, and the ablation is what showed it:
+//! without the heuristic, recall still climbs past the target on both datasets — 0.9980 on SIFT1M
+//! and 0.9050 on GloVe. There is no ceiling. The curve shifts right by roughly 2.5× in `ef`, which
+//! is a large and worthwhile difference and a different claim.
+//!
+//! The effect on edge symmetry was not predicted at all, and follows from the mechanism: a
+//! candidate the heuristic keeps is one that is closer to the query than to its already-chosen
+//! neighbours, which is a more mutual relationship than merely landing among the nearest `M`.
 //!
 //! Two flags from the paper, both settled here rather than left open:
 //!

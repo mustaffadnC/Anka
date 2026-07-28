@@ -354,7 +354,55 @@ stays.
 
 ### hnswlib comparison
 
-*pending*
+Same dataset, same `M` / `ef_construction` / `ef` / `k`, same machine, both single-threaded, both
+medians of three repetitions. hnswlib built **from source with `-O3 -march=native`**, not from the
+pip wheel — verified by checking that the extension module was actually replaced, because an
+earlier attempt at this failed silently and measured the wheel while labelling it native.
+
+**SIFT1M** (`M`=16, `ef_construction`=200):
+
+| `ef` | Anka recall | Anka QPS | hnswlib recall | hnswlib QPS | hnswlib / Anka |
+|---|---|---|---|---|---|
+| 40 | 0.9372 | 6 722 | 0.9266 | 9 065 | 1.35× |
+| 80 | 0.9780 | 4 015 | 0.9745 | 5 515 | 1.37× |
+| 160 | 0.9942 | 2 737 | 0.9932 | 3 053 | 1.12× |
+| 320 | 0.9985 | 1 382 | 0.9982 | 1 650 | 1.19× |
+
+**GloVe-100** (cosine):
+
+| `ef` | Anka recall | Anka QPS | hnswlib recall | hnswlib QPS | hnswlib / Anka |
+|---|---|---|---|---|---|
+| 160 | 0.8535 | 2 178 | 0.8509 | 2 562 | 1.18× |
+| 320 | 0.9000 | 1 183 | 0.8985 | 1 453 | 1.23× |
+| 800 | 0.9469 | 525 | 0.9458 | 590 | 1.12× |
+
+Build time: 485.3 s against 377.7 s on SIFT1M (1.28×), 609.9 s against 582.7 s on GloVe (1.05×).
+
+**H2 met with room to spare.** The target is "within 3× of hnswlib at equal recall, single
+threaded". Measured, hnswlib is **1.12–1.37× faster** across both datasets. Anka's recall also
+comes out slightly *higher* at every `ef` — 0.9780 against 0.9745, 0.9000 against 0.8985 — so at
+equal recall the gap narrows further, to roughly 1.2× on SIFT1M.
+
+Two things this measurement corrected, and both are worth more than the numbers.
+
+**`-march=native` made no difference to hnswlib.** The wheel gave 5 499 QPS at `ef`=80 and the
+native build gives 5 515 — inside the noise. hnswlib dispatches its SIMD kernels at runtime, so
+compiler flags barely touch it. The fairness concern that motivated the rebuild turned out to be
+unfounded, which is only knowable because it was checked rather than assumed.
+
+**An earlier claim of ours was noise, and is retracted.** Single-run numbers suggested hnswlib was
+1.56–1.86× faster on GloVe against 1.25–1.43× on SIFT1M, and a hypothesis was floated for it:
+GloVe's dim 100 gives 400-byte vectors that never align to a cache line, where SIFT's dim 128 gives
+exactly 512. With three repetitions the gap is 1.12–1.23× on GloVe and 1.12–1.37× on SIFT — there
+is no dataset-dependent penalty to explain. Both sides had moved: Anka from 1 015 to 1 183 QPS at
+`ef`=320, hnswlib from 1 886 down to 1 453. **The effect did not exist, and the explanation for it
+was reasoning about noise.** The cache-line idea may still be true; it is simply not evidence for
+anything measured here.
+
+Which is what the repetitions are for. Widest QPS spread across three runs: 18.8% for Anka on
+SIFT1M, 14.7% for hnswlib on GloVe. Neither side is systematically noisier, and at that variance a
+single sample cannot resolve a 1.2× difference. Pinning clock behaviour is still an outstanding gap
+(see the environment table).
 
 ### Ablations — SIFT1M (`M`=16, `ef_construction`=200)
 
@@ -412,14 +460,60 @@ graph is cheaper to traverse, so at `ef`=80 the ablated index gives 4 597 QPS at
 graph closer to what the paper describes. But calling it a recall requirement, as the spec did,
 overstates it on SIFT1M.
 
-#### Why these are not the last word
+### Ablations — GloVe-100
 
-Both spec claims are about *clustered* data, and SIFT1M is not strongly clustered — which is the
-reason the project measures GloVe-100 at all. The ablations on GloVe are the ones that can support
-or refute the original claims, and correcting the spec on SIFT evidence alone would repeat exactly
-the mistake this project is meant to avoid.
+Both spec claims are about *clustered* data, and SIFT1M is not strongly clustered — which is why
+GloVe is in the suite. These are the runs that can support or refute the original wording.
 
-**GloVe-100 ablations:** *pending*
+| Configuration | `ef`=80 | `ef`=320 | `ef`=800 | Layer 0 mean degree | One-way edges |
+|---|---|---|---|---|---|
+| Full | 0.7915 | **0.9000** | 0.9469 | 24.79 | 18.97% |
+| Heuristic off | 0.6983 | 0.8489 | 0.9050 | 23.11 | **34.64%** |
+| Keep-pruned off | 0.7878 | 0.8986 | 0.9464 | 22.98 | 19.32% |
+
+**The heuristic matters much more here, and the spec's reasoning was right about why.** Dropping it
+costs 9.3 points at `ef`=80 against 3.3 on SIFT1M, and it moves where the 0.90 target is reachable
+from `ef`=320 to `ef`=800:
+
+| | recall | `ef` | QPS |
+|---|---|---|---|
+| Heuristic on | 0.9000 | 320 | **1 183** |
+| Heuristic off | 0.9050 | 800 | 513 |
+
+So **2.3× throughput at the target recall on GloVe**, against 1.50× on SIFT1M. The prediction that
+the heuristic earns its keep on clustered data is confirmed, with a number.
+
+What is *not* confirmed is the failure mode. The spec said skipping it leaves recall "stuck in the
+seventies, and raising `ef` does not help". On the harder of the two datasets, without the
+heuristic, recall still climbs to 0.9050 and still clears the target. There is no cliff on either
+dataset — there is a curve shifted right by roughly 2.5× in `ef`.
+
+**The heuristic also halves edge asymmetry**, and more so here: 34.64% one-way without it against
+18.97% with, mirroring 25.75% against 14.91% on SIFT1M. Nothing in the spec anticipated this in
+either direction. It follows from the mechanism — a candidate the heuristic keeps is one that is
+closer to the query than to its already-chosen neighbours, which is a more mutual relationship than
+"happens to be among the nearest 16" — but it was not predicted, and it is not something recall
+alone would reveal.
+
+**Keep-pruned is negligible on GloVe too**, and by a wider margin than on SIFT1M: 0.4 points at
+`ef`=80, 0.1 at 320, 0.05 at 800. The degree distribution thins exactly as predicted — layer 4 mean
+degree 4.50 against 15.00, layer 1 15.47 against 16.00 — so the *mechanism* is confirmed on both
+datasets while the *consequence* is not, on either.
+
+#### What the spec got wrong, and what it got right
+
+| Claim | Verdict |
+|---|---|
+| The heuristic is worth having | **Right.** 1.50× throughput at equal recall on SIFT1M, 2.3× on GloVe |
+| It matters more on clustered data | **Right**, and now quantified |
+| Skipping it caps recall in the seventies, `ef` cannot rescue it | **Wrong.** No cap on either dataset; the curve shifts right by ~2.5× in `ef` |
+| Keep-pruned thins the graph where candidates are pruned hardest | **Right**, and the effect grows with layer height |
+| Keep-pruned is needed for recall | **Overstated.** ≤0.9 points on SIFT1M, ≤0.4 on GloVe, roughly free either way |
+| The heuristic's effect on edge symmetry | **Not predicted.** It halves the share of one-way edges |
+
+Both defaults stay as they are: the heuristic because it is worth 1.5–2.3×, and keep-pruned because
+it costs nothing measurable and keeps the graph closer to what the paper describes. The spec wording
+has been corrected in v1.4 rather than the measurements explained.
 
 ### Distance computations
 
