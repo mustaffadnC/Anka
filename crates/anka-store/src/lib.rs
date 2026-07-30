@@ -7,3 +7,12 @@
 //!   directory `fsync` can lose the rename across a crash
 //! - every WAL record carries a `seq`, and every INSERT carries the assigned HNSW `level`,
 //!   so replay is both well-defined and deterministic
+//!
+//! Built in order: [`header`] first, because the format has to be pinned down before anything can
+//! be written into it.
+
+pub mod error;
+pub mod header;
+
+pub use error::SnapshotError;
+pub use header::{FORMAT_VERSION, HEADER_BYTES, HeaderFlags, Section, SnapshotHeader};
