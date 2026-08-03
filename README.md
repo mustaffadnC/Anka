@@ -1,7 +1,13 @@
 # Anka
 
+[![CI](https://github.com/mustaffadnC/Anka/actions/workflows/ci.yml/badge.svg)](https://github.com/mustaffadnC/Anka/actions/workflows/ci.yml)
+
 A vector search engine written from scratch in Rust: HNSW index, int8 scalar quantization,
 metadata filtering, durability (WAL + snapshot), and an HTTP API.
+
+> **Built with AI coding tools.** Much of the code here was scaffolded and iterated using Claude
+> Code. The benchmark methodology — which datasets, which baseline, which parameters held equal,
+> and what the roofline says the ceiling is — is mine, and so is every conclusion drawn from it.
 
 **The point of this project is the measurement, not the implementation.** Plenty of
 repositories say "I implemented HNSW". This one aims to say: *I implemented HNSW, plotted
