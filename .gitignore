@@ -25,3 +25,7 @@ Thumbs.db
 # Internal Turkish working spec — not part of the published repository.
 # The repo-facing design document is docs/DESIGN.md.
 ANKA_PROJE_SPEC.md
+
+# Assistant working notes, kept out of the repository for the same reason as the spec above.
+# Delete this line to publish it.
+CLAUDE.md
