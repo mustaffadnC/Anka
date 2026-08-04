@@ -23,6 +23,26 @@ use anka_core::NodeId;
 /// bounded by `NodeId::MAX`, so a *slot* can never legitimately be `u32::MAX`.
 const NO_SLOT: u32 = u32::MAX;
 
+/// A layer's two arrays do not describe a layer.
+///
+/// Separate from [`crate::hnsw::validate::GraphViolation`], which is about a graph being wrong.
+/// These are about the bytes not being a graph at all, which is what a corrupt file produces and
+/// has to be caught before anything indexes into them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum LayerShapeError {
+    #[error("adjacency of {len} entries does not divide into slots of {stride}")]
+    RaggedAdjacency { len: usize, stride: usize },
+
+    #[error("dense layer carries a slot table of {len} entries; layer 0's slot is its node id")]
+    DenseLayerHasSlotTable { len: usize },
+
+    #[error("{nodes} nodes for {slots} adjacency slots")]
+    SlotCountMismatch { nodes: usize, slots: usize },
+
+    #[error("node {node} occupies two slots")]
+    DuplicateNode { node: NodeId },
+}
+
 /// Adjacency for a single layer.
 pub struct Layer {
     /// `NodeId → slot` for sparse layers. `None` on layer 0, which holds every node: there the
@@ -201,6 +221,83 @@ impl Layer {
         }
     }
 
+    /// The flat adjacency array, exactly as it is laid out in memory.
+    ///
+    /// This is what goes to disk. The layout survives the round trip unchanged because it holds
+    /// slot offsets rather than pointers, which is why it was chosen.
+    pub fn raw_neighbors(&self) -> &[NodeId] {
+        &self.neighbors
+    }
+
+    /// `slot → NodeId` for a sparse layer; empty for a dense one, where it is the identity.
+    pub fn slot_nodes(&self) -> &[NodeId] {
+        &self.nodes
+    }
+
+    /// Rebuilds a layer from the two arrays [`Self::raw_neighbors`] and [`Self::slot_nodes`]
+    /// return.
+    ///
+    /// Used by snapshot loading, where the arrays come from an untrusted file, so the shape is
+    /// checked here rather than trusted: the adjacency array has to divide evenly into slots, and
+    /// there has to be exactly one node per slot. Whether the *contents* make a valid graph — ids
+    /// in range, no dangling edges — is [`crate::hnsw::HnswIndex::validate`]'s job, since that
+    /// costs a pass over every edge and the caller decides when to pay it.
+    pub fn from_parts(
+        max_degree: usize,
+        dense: bool,
+        nodes: Vec<NodeId>,
+        neighbors: Vec<NodeId>,
+    ) -> Result<Self, LayerShapeError> {
+        let stride = max_degree + 1;
+        if !neighbors.len().is_multiple_of(stride) {
+            return Err(LayerShapeError::RaggedAdjacency {
+                len: neighbors.len(),
+                stride,
+            });
+        }
+        let slots = neighbors.len() / stride;
+
+        if dense {
+            if !nodes.is_empty() {
+                return Err(LayerShapeError::DenseLayerHasSlotTable { len: nodes.len() });
+            }
+            return Ok(Self {
+                slot_of: None,
+                nodes,
+                neighbors,
+                max_degree,
+            });
+        }
+
+        if nodes.len() != slots {
+            return Err(LayerShapeError::SlotCountMismatch {
+                nodes: nodes.len(),
+                slots,
+            });
+        }
+
+        // The `NodeId → slot` table is derived rather than stored: it is the inverse of `nodes`,
+        // so writing it would be redundant bytes that could disagree with what they mirror.
+        let mut slot_of = Vec::new();
+        for (slot, &node) in nodes.iter().enumerate() {
+            let needed = node as usize + 1;
+            if slot_of.len() < needed {
+                slot_of.resize(needed, NO_SLOT);
+            }
+            if slot_of[node as usize] != NO_SLOT {
+                return Err(LayerShapeError::DuplicateNode { node });
+            }
+            slot_of[node as usize] = slot as u32;
+        }
+
+        Ok(Self {
+            slot_of: Some(slot_of),
+            nodes,
+            neighbors,
+            max_degree,
+        })
+    }
+
     /// Bytes held by this layer's tables.
     ///
     /// Reported per layer because the sparse-vs-dense decision is justified by these numbers,
@@ -331,6 +428,78 @@ mod tests {
         assert_eq!(layer.neighbors(0), &[10, 11, 12]);
         assert_eq!(layer.neighbors(1), &[20]);
         assert_eq!(layer.neighbors(2), &[30, 31]);
+    }
+
+    /// What a snapshot round trip has to preserve: the same neighbours for the same nodes, and
+    /// the `NodeId → slot` table rebuilt from the slot list rather than stored.
+    #[test]
+    fn a_layer_survives_a_round_trip_through_its_raw_arrays() {
+        for dense in [true, false] {
+            let mut layer = if dense {
+                Layer::dense(4, 6)
+            } else {
+                Layer::sparse(4)
+            };
+            let members: Vec<NodeId> = if dense {
+                (0..6).collect()
+            } else {
+                vec![3, 11, 40]
+            };
+            for &node in &members {
+                layer.add(node);
+            }
+            layer.set_neighbors(members[0], &[members[1], members[2]]);
+            layer.set_neighbors(members[2], &[members[0]]);
+
+            let restored = Layer::from_parts(
+                layer.max_degree(),
+                dense,
+                layer.slot_nodes().to_vec(),
+                layer.raw_neighbors().to_vec(),
+            )
+            .expect("well-shaped");
+
+            assert_eq!(restored.is_dense(), dense);
+            assert_eq!(restored.len(), layer.len());
+            assert_eq!(
+                restored.nodes().collect::<Vec<_>>(),
+                layer.nodes().collect::<Vec<_>>()
+            );
+            for &node in &members {
+                assert!(restored.contains(node));
+                assert_eq!(
+                    restored.neighbors(node),
+                    layer.neighbors(node),
+                    "node {node}"
+                );
+            }
+            // A node that was never added must still read as absent after the rebuild.
+            assert!(!restored.contains(99));
+        }
+    }
+
+    #[test]
+    fn malformed_layer_arrays_are_rejected() {
+        // 7 entries cannot divide into slots of 5.
+        assert_eq!(
+            Layer::from_parts(4, true, Vec::new(), vec![0; 7]).unwrap_err(),
+            LayerShapeError::RaggedAdjacency { len: 7, stride: 5 }
+        );
+        // Layer 0's slot is its node id, so a slot table there is a contradiction.
+        assert_eq!(
+            Layer::from_parts(4, true, vec![0, 1], vec![0; 10]).unwrap_err(),
+            LayerShapeError::DenseLayerHasSlotTable { len: 2 }
+        );
+        // Two slots of adjacency, three nodes claiming them.
+        assert_eq!(
+            Layer::from_parts(4, false, vec![0, 1, 2], vec![0; 10]).unwrap_err(),
+            LayerShapeError::SlotCountMismatch { nodes: 3, slots: 2 }
+        );
+        // The same node in two slots would make the derived table ambiguous.
+        assert_eq!(
+            Layer::from_parts(4, false, vec![5, 5], vec![0; 10]).unwrap_err(),
+            LayerShapeError::DuplicateNode { node: 5 }
+        );
     }
 
     /// The reason sparse layers exist. A dense layer over a million nodes costs 4 bytes per

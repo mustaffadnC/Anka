@@ -27,6 +27,25 @@ pub struct HnswIndex {
     levels: crate::hnsw::params::LevelGenerator,
 }
 
+/// The pieces an index is made of, as a snapshot stores them.
+///
+/// A struct rather than eight positional arguments: they are mostly integers and node ids, and
+/// two of them transposed would build a subtly wrong index rather than fail to compile.
+#[derive(Debug)]
+pub struct IndexParts {
+    pub vectors: VectorStore,
+    pub params: HnswParams,
+    pub metric: MetricKind,
+    /// Layer 0 first. Dense at 0, sparse above.
+    pub layers: Vec<Layer>,
+    /// Highest layer each node reaches, indexed by node id.
+    pub node_levels: Vec<u8>,
+    pub entry_point: Option<NodeId>,
+    pub max_layer: usize,
+    /// See [`HnswIndex::levels_drawn`].
+    pub levels_drawn: u64,
+}
+
 impl HnswIndex {
     pub fn new(dim: usize, metric: MetricKind, params: HnswParams) -> Result<Self, IndexError> {
         Self::with_capacity(dim, metric, params, 0)
@@ -96,9 +115,92 @@ impl HnswIndex {
         self.layers.iter().map(Layer::memory_bytes).sum::<usize>() + self.node_levels.capacity()
     }
 
+    /// How many levels the generator has drawn.
+    ///
+    /// Recorded in a snapshot so a reloaded index continues the same sequence. Not derivable from
+    /// [`Self::len`]: [`Self::insert_at_level`] adds a node without drawing.
+    pub fn levels_drawn(&self) -> u64 {
+        self.levels.drawn()
+    }
+
     /// A searcher sized for this index.
     pub fn searcher(&self) -> Searcher {
         Searcher::new(self.len().max(1))
+    }
+
+    /// Rebuilds an index from the pieces a snapshot stores.
+    ///
+    /// The checks here are the ones that stop a corrupt file from turning into a panic: every
+    /// index computed from these fields has to land inside the arrays they describe. They are all
+    /// `O(count)`. The deeper question — whether the *edges* form a valid graph — is
+    /// [`Self::validate`]'s, which costs a pass over all 26 million of them on SIFT1M, so the
+    /// caller decides when to pay for it.
+    pub fn from_parts(parts: IndexParts) -> Result<Self, IndexError> {
+        let IndexParts {
+            vectors,
+            params,
+            metric,
+            layers,
+            node_levels,
+            entry_point,
+            max_layer,
+            levels_drawn,
+        } = parts;
+
+        if node_levels.len() != vectors.len() {
+            return Err(IndexError::LevelCountMismatch {
+                levels: node_levels.len(),
+                vectors: vectors.len(),
+            });
+        }
+        if layers.len() != max_layer + 1 {
+            return Err(IndexError::LayerCountMismatch {
+                layers: layers.len(),
+                max_layer,
+            });
+        }
+        // Layer 0 addresses slots by node id with no indirection, so it has to be exactly as long
+        // as the collection; anything shorter would index past the end during traversal.
+        if !vectors.is_empty() && layers[0].len() != vectors.len() {
+            return Err(IndexError::LayerZeroIncomplete {
+                found: layers[0].len(),
+                expected: vectors.len(),
+            });
+        }
+        for (lc, layer) in layers.iter().enumerate() {
+            let expected = params.max_degree(lc);
+            if layer.max_degree() != expected {
+                return Err(IndexError::LayerDegreeMismatch {
+                    layer: lc,
+                    expected,
+                    found: layer.max_degree(),
+                });
+            }
+        }
+        if let Some(&level) = node_levels.iter().max()
+            && level as usize > max_layer
+        {
+            let node = node_levels
+                .iter()
+                .position(|&l| l == level)
+                .expect("the maximum came from this slice") as u32;
+            return Err(IndexError::LevelAboveMaxLayer {
+                node,
+                level: level as usize,
+                max_layer,
+            });
+        }
+
+        Ok(Self {
+            levels: params.restored_level_generator(levels_drawn),
+            vectors,
+            params,
+            metric,
+            layers,
+            node_levels,
+            entry_point,
+            max_layer,
+        })
     }
 
     /// Inserts `vector`, drawing its level from the seeded generator.
@@ -709,5 +811,162 @@ mod tests {
             computed < count as u64 / 4,
             "one query cost {computed} distance computations against {count} vectors"
         );
+    }
+
+    /// Takes an index apart into exactly what a snapshot stores, then puts it back — the same
+    /// path `anka-store` takes, minus the file.
+    fn disassemble(index: &HnswIndex) -> IndexParts {
+        let dim = index.dim();
+        let layers = index
+            .layers()
+            .iter()
+            .enumerate()
+            .map(|(lc, layer)| {
+                Layer::from_parts(
+                    layer.max_degree(),
+                    lc == 0,
+                    layer.slot_nodes().to_vec(),
+                    layer.raw_neighbors().to_vec(),
+                )
+                .expect("a live layer is well-shaped")
+            })
+            .collect();
+
+        IndexParts {
+            vectors: VectorStore::from_flat(
+                dim,
+                index.vectors().as_contiguous().expect("owned").to_vec(),
+            )
+            .unwrap(),
+            params: *index.params(),
+            metric: index.metric(),
+            layers,
+            node_levels: (0..index.len())
+                .map(|n| index.level_of(n as NodeId).unwrap() as u8)
+                .collect(),
+            entry_point: index.entry_point(),
+            max_layer: index.max_layer(),
+            levels_drawn: index.levels_drawn(),
+        }
+    }
+
+    /// The phase 3 claim in miniature: an index taken apart and rebuilt answers every query
+    /// identically, distances included.
+    #[test]
+    fn a_rebuilt_index_answers_identically() {
+        let dim = 8;
+        let data = points(21, 2_000, dim);
+        let queries = points(22, 50, dim);
+        let original = build(HnswParams::default(), &data, dim);
+
+        let rebuilt = HnswIndex::from_parts(disassemble(&original)).expect("well-formed parts");
+        rebuilt.validate().expect("a rebuilt graph is still valid");
+
+        assert_eq!(rebuilt.len(), original.len());
+        assert_eq!(rebuilt.max_layer(), original.max_layer());
+        assert_eq!(rebuilt.entry_point(), original.entry_point());
+        assert_eq!(rebuilt.levels_drawn(), original.levels_drawn());
+
+        let mut a = original.searcher();
+        let mut b = rebuilt.searcher();
+        let mut counter = DistanceCounter::new();
+        for query in queries.chunks_exact(dim) {
+            let before = original
+                .search::<L2Squared>(&mut a, query, 10, 64, &mut counter)
+                .unwrap();
+            let after = rebuilt
+                .search::<L2Squared>(&mut b, query, 10, 64, &mut counter)
+                .unwrap();
+            // `Candidate` compares on `(dist, id)`, so this is bit-identical distances as well as
+            // identical ids — which is the DoD's wording, not a paraphrase of it.
+            assert_eq!(before, after);
+        }
+    }
+
+    /// Restoring the generator matters only if the index is written to again. It is, after a
+    /// checkpoint, so a reloaded index has to keep drawing the same levels it would have.
+    #[test]
+    fn a_rebuilt_index_continues_the_same_level_sequence() {
+        let dim = 4;
+        let data = points(23, 300, dim);
+        let mut original = build(HnswParams::default(), &data, dim);
+        let rebuilt = HnswIndex::from_parts(disassemble(&original)).unwrap();
+
+        let extra = points(24, 20, dim);
+        let mut searcher = original.searcher();
+        let mut counter = DistanceCounter::new();
+        for vector in extra.chunks_exact(dim) {
+            original
+                .insert::<L2Squared>(&mut searcher, vector, &mut counter)
+                .unwrap();
+        }
+
+        let mut rebuilt = rebuilt;
+        let mut searcher = rebuilt.searcher();
+        for vector in extra.chunks_exact(dim) {
+            rebuilt
+                .insert::<L2Squared>(&mut searcher, vector, &mut counter)
+                .unwrap();
+        }
+
+        let levels_original: Vec<usize> = (0..original.len())
+            .map(|n| original.level_of(n as NodeId).unwrap())
+            .collect();
+        let levels_rebuilt: Vec<usize> = (0..rebuilt.len())
+            .map(|n| rebuilt.level_of(n as NodeId).unwrap())
+            .collect();
+        assert_eq!(levels_original, levels_rebuilt);
+        assert_eq!(original.max_layer(), rebuilt.max_layer());
+    }
+
+    #[test]
+    fn malformed_parts_are_rejected_rather_than_indexed_into() {
+        let dim = 4;
+        let data = points(25, 200, dim);
+        let index = build(HnswParams::default(), &data, dim);
+
+        let mut parts = disassemble(&index);
+        parts.node_levels.pop();
+        assert!(matches!(
+            HnswIndex::from_parts(parts),
+            Err(IndexError::LevelCountMismatch { .. })
+        ));
+
+        let mut parts = disassemble(&index);
+        parts.max_layer += 1;
+        assert!(matches!(
+            HnswIndex::from_parts(parts),
+            Err(IndexError::LayerCountMismatch { .. })
+        ));
+
+        // A level above max_layer would send `validate` into a layer that does not exist.
+        let mut parts = disassemble(&index);
+        let top = parts.max_layer as u8;
+        parts.node_levels[0] = top + 1;
+        assert!(matches!(
+            HnswIndex::from_parts(parts),
+            Err(IndexError::LevelAboveMaxLayer { node: 0, .. })
+        ));
+
+        // Layer 0 addresses slots by node id, so a short one would read past the end.
+        let mut parts = disassemble(&index);
+        parts.layers[0] = Layer::dense(index.params().max_degree0(), 0);
+        assert!(matches!(
+            HnswIndex::from_parts(parts),
+            Err(IndexError::LayerZeroIncomplete { found: 0, .. })
+        ));
+
+        let mut parts = disassemble(&index);
+        parts.layers[0] = Layer::from_parts(
+            index.params().max_degree0() + 1,
+            true,
+            Vec::new(),
+            vec![0; (index.params().max_degree0() + 2) * index.len()],
+        )
+        .unwrap();
+        assert!(matches!(
+            HnswIndex::from_parts(parts),
+            Err(IndexError::LayerDegreeMismatch { layer: 0, .. })
+        ));
     }
 }

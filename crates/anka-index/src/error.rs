@@ -36,4 +36,34 @@ pub enum IndexError {
 
     #[error("the index was built with dimension {expected}, got {found}")]
     DimMismatch { expected: usize, found: usize },
+
+    #[error(transparent)]
+    LayerShape(#[from] crate::hnsw::LayerShapeError),
+
+    /// Every node needs a recorded level, and every level needs a node. A mismatch means the two
+    /// sections of a snapshot describe different indexes.
+    #[error("{levels} recorded levels for {vectors} vectors")]
+    LevelCountMismatch { levels: usize, vectors: usize },
+
+    #[error("{layers} layers supplied, but max_layer is {max_layer}")]
+    LayerCountMismatch { layers: usize, max_layer: usize },
+
+    /// Layer 0 carries every node by construction. A snapshot whose layer 0 is short would leave
+    /// nodes unreachable, and the dense slot arithmetic would read past the end.
+    #[error("layer 0 holds {found} nodes, but the index has {expected}")]
+    LayerZeroIncomplete { found: usize, expected: usize },
+
+    #[error("layer {layer} was built with degree cap {expected}, but holds slots of {found}")]
+    LayerDegreeMismatch {
+        layer: usize,
+        expected: usize,
+        found: usize,
+    },
+
+    #[error("node {node} records level {level}, above the maximum layer {max_layer}")]
+    LevelAboveMaxLayer {
+        node: u32,
+        level: usize,
+        max_layer: usize,
+    },
 }

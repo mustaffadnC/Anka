@@ -142,6 +142,11 @@ impl HnswParams {
     pub fn level_generator(&self) -> LevelGenerator {
         LevelGenerator::new(self.seed, self.level_multiplier)
     }
+
+    /// A generator fast-forwarded past `drawn` levels — the state a snapshot records.
+    pub fn restored_level_generator(&self, drawn: u64) -> LevelGenerator {
+        LevelGenerator::restore(self.seed, self.level_multiplier, drawn)
+    }
 }
 
 /// Draws the level a new node is inserted at.
@@ -157,6 +162,7 @@ impl HnswParams {
 pub struct LevelGenerator {
     rng: StdRng,
     multiplier: f64,
+    drawn: u64,
 }
 
 impl LevelGenerator {
@@ -164,11 +170,38 @@ impl LevelGenerator {
         Self {
             rng: StdRng::seed_from_u64(seed),
             multiplier,
+            drawn: 0,
         }
+    }
+
+    /// Re-creates the state a generator reaches after `drawn` levels, by drawing them again.
+    ///
+    /// `StdRng` has no portable way to export its state, and a snapshot that recorded an opaque
+    /// blob would be tied to `rand`'s internals. Re-drawing costs one `f64` per vector — a few
+    /// milliseconds at a million — and is exact by construction.
+    pub fn restore(seed: u64, multiplier: f64, drawn: u64) -> Self {
+        let mut generator = Self::new(seed, multiplier);
+        for _ in 0..drawn {
+            generator.next_level();
+        }
+        generator
+    }
+
+    /// How many levels this generator has produced.
+    ///
+    /// Not the same as the number of vectors in the index, which is why it has to be recorded
+    /// separately: WAL replay inserts at the level written in the record and never draws one.
+    /// An index restored from a snapshot plus replay therefore has more nodes than draws, and
+    /// deriving the count from either would put the generator out of step.
+    pub fn drawn(&self) -> u64 {
+        self.drawn
     }
 
     /// The level for the next node.
     pub fn next_level(&mut self) -> usize {
+        // Counted before the early return so both paths agree, which is what lets `restore`
+        // reproduce the state by calling this same function.
+        self.drawn += 1;
         if self.multiplier == 0.0 {
             return 0;
         }
@@ -184,6 +217,7 @@ impl std::fmt::Debug for LevelGenerator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LevelGenerator")
             .field("multiplier", &self.multiplier)
+            .field("drawn", &self.drawn)
             .finish_non_exhaustive()
     }
 }
@@ -321,6 +355,38 @@ mod tests {
                  tolerance {tolerance:.6}"
             );
         }
+    }
+
+    /// A snapshot records the number of draws, not the generator's internals, so restoring has to
+    /// put it back on exactly the same sequence.
+    #[test]
+    fn a_restored_generator_continues_the_same_sequence() {
+        let params = HnswParams::default();
+
+        let mut original = params.level_generator();
+        let consumed: Vec<usize> = (0..1_000).map(|_| original.next_level()).collect();
+        let rest: Vec<usize> = (0..500).map(|_| original.next_level()).collect();
+        assert_eq!(original.drawn(), 1_500);
+
+        let mut restored = params.restored_level_generator(consumed.len() as u64);
+        assert_eq!(restored.drawn(), 1_000);
+        let continued: Vec<usize> = (0..500).map(|_| restored.next_level()).collect();
+
+        assert_eq!(continued, rest);
+        assert_eq!(restored.drawn(), original.drawn());
+    }
+
+    /// The flat-graph shortcut returns before touching the RNG. The counter still has to advance,
+    /// or restoring an `M = 1` index would disagree with itself.
+    #[test]
+    fn draws_are_counted_even_on_the_flat_graph_path() {
+        let params = HnswParams::new(1).unwrap();
+        let mut generator = params.level_generator();
+        for _ in 0..100 {
+            generator.next_level();
+        }
+        assert_eq!(generator.drawn(), 100);
+        assert_eq!(params.restored_level_generator(100).drawn(), 100);
     }
 
     #[test]

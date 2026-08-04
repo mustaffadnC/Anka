@@ -24,8 +24,8 @@ pub mod stats;
 pub mod validate;
 pub mod visited;
 
-pub use index::HnswIndex;
-pub use layer::Layer;
+pub use index::{HnswIndex, IndexParts};
+pub use layer::{Layer, LayerShapeError};
 pub use params::{HnswParams, LevelGenerator, MAX_LEVEL};
 pub use search::Searcher;
 pub use select::{SelectionPolicy, select_neighbors};
