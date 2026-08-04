@@ -25,7 +25,7 @@ numbers.
 | Release profile | `lto = "thin"`, `codegen-units = 1`, debug symbols kept for profiling |
 | Storage | datasets and build output on ext4, source tree on `/mnt/c` |
 | RNG seed | not applicable yet — nothing is random before phase 2 |
-| Clock-variance handling | **not yet applied.** The Windows power plan has not been pinned, contrary to spec section 6 rule 3. Repeatability was measured instead: 0.05–0.23% spread across full runs. This is adequate for measurements lasting minutes and will need fixing before phase 2's `ef` sweeps. |
+| Clock-variance handling | **not applied, and it matters.** The Windows power plan is not pinned and WSL2 does not expose the host's frequency controls. Within one run the spread is small (0.05–0.23% for phase 1's minute-long kernels, 1.0–3.0% for a phase 2 `ef` sweep). *Between* sessions a bit-identical index measured **1.70× apart** — see "Across sessions, throughput on this machine moves by 1.70×". Every A/B claim here therefore runs both sides in one session, alternating. |
 | Query threads | 1 for the criterion benchmarks; 12 (rayon) for ground-truth generation, noted where it applies |
 
 ### Datasets
@@ -404,6 +404,36 @@ SIFT1M, 14.7% for hnswlib on GloVe. Neither side is systematically noisier, and 
 single sample cannot resolve a 1.2× difference. Pinning clock behaviour is still an outstanding gap
 (see the environment table).
 
+### Across sessions, throughput on this machine moves by 1.70×
+
+The three repetitions above bound the variance *within* one run. They say nothing about the
+variance *between* runs on different days, and that turns out to be much larger.
+
+Re-running the identical sweep during phase 3 produced a bit-identical index — 26 760 362 edges,
+14.91% one-way, the same layer occupancy, and recall equal to four decimal places at every `ef` —
+at throughput far above what the table above records:
+
+| `ef` | Phase 2 session | Phase 3 session | Ratio | Recall, both sessions |
+|---|---|---|---|---|
+| 40 | 6 722 | 11 400 | 1.70× | 0.9372 |
+| 80 | 4 015 | 6 381 | 1.59× | 0.9780 |
+| 160 | 2 737 | 3 447 | 1.26× | 0.9942 |
+| 320 | 1 382 | 1 875 | 1.36× | 0.9985 |
+
+Build time moved with it: 485.3 s against 327.7 s, 1.48×. Within-run spread in the later session
+was 1.0–3.0%, so neither run was internally unstable — the whole machine was simply in a different
+state. The Windows power plan is still not pinned and WSL2 does not expose the host's frequency
+controls, so this is not currently fixable from inside the measurement harness.
+
+**What this invalidates:** any comparison of absolute QPS across sessions, including comparing a
+later optimisation against a number recorded here. **What it does not invalidate:** the hnswlib
+ratios, because `scripts/` runs both engines back to back inside one script invocation — the
+1.12–1.37× figure is a same-session ratio and drift cancels out of it.
+
+The rule this produces, and it is now the standard for every performance claim in this document:
+**an A/B comparison must run both sides in the same session, alternating.** A number carried over
+from a previous session is a baseline for correctness, never for speed.
+
 ### Ablations — SIFT1M (`M`=16, `ef_construction`=200)
 
 Both flags exist so this table can be produced. Both results are weaker than the spec predicted,
@@ -586,6 +616,51 @@ hot loop.
 ---
 
 ## 4. Phase 3 — Persistence
+
+### What the hybrid-storage accessor costs
+
+Persistence forces a store whose vectors live in two places: a read-only snapshot mapping with
+write-ahead-log replay appended after it. That removed the option of handing hot loops one flat
+`&[f32]`. They now take a resolved `Vectors` view and index it, which moves a branch *into* the
+loop — the search path touches it once per candidate.
+
+A criterion microbenchmark isolates that branch: 4 096 vectors at dim 128, 2 MiB, deliberately
+L3-resident so the question is about the branch and not about DDR5.
+
+| Path | Time | Throughput | vs. plain slice |
+|---|---|---|---|
+| plain slice chunking (pre-refactor) | 20.715 µs | 25.309 Gelem/s | — |
+| `Vectors::Contiguous` | 22.785 µs | 23.011 Gelem/s | +10.0% |
+| `Vectors::Split` (hybrid) | 23.656 µs | 22.163 Gelem/s | +14.2% |
+
+10% is more than the 1–3% expected, so the next question is whether it survives contact with the
+real access pattern. It does not. Both versions were built — the pre-refactor one from `HEAD` in a
+detached worktree — and run **alternately in one session**, `before / after / before / after`, each
+`--repeat 3`:
+
+| `ef` | before ① | after ② | before ③ | after ④ | mean before | mean after | change |
+|---|---|---|---|---|---|---|---|
+| 40 | 9 859 | 10 762 | 9 212 | 10 048 | 9 536 | 10 405 | +9.1% |
+| 80 | 5 513 | 5 976 | 5 426 | 5 557 | 5 470 | 5 766 | +5.4% |
+| 160 | 3 026 | 3 151 | 2 702 | 3 058 | 2 864 | 3 104 | +8.4% |
+| 320 | 1 700 | 1 718 | 1 520 | 1 626 | 1 610 | 1 672 | +3.9% |
+
+Recall is unchanged at every `ef` and the graph is bit-identical, so this is the same work measured
+twice. The refactored version is ahead in all eight pairwise comparisons, and the machine drifted
+*downwards* across the session (both sides are slower in round 2), which penalises the version that
+runs second in each round — the refactored one.
+
+**The honest reading is not "the refactor made it faster."** Nothing in it removes work, and a
+4–9% swing between two binaries is well within what code layout and inlining decisions produce on
+their own. The conclusion is narrower and is the one that matters: **the 10% measured in cache is
+not detectable end to end.** HNSW search walks a graph at random over 512 MB and is latency-bound;
+a correctly-predicted branch disappears underneath a cache miss. Build time — which is dominated by
+the same inner loop — moved 1.6%, also nothing.
+
+This is what phase 5's quantization claims will have to clear, and the reason a microbenchmark
+alone will not be accepted as evidence for them.
+
+### Durability
 
 | Check | Result |
 |---|---|

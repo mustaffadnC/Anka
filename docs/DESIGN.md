@@ -402,8 +402,17 @@ different machine and only correctness is checked there.
 Two profiling caveats specific to this setup: WSL2 does not virtualise the PMU, so `perf`
 hardware counters are unavailable — cache behaviour is measured with `cachegrind` (simulated,
 useful as a ratio) or with AMD uProf against a Windows build, noted as such wherever it appears.
-And `cpupower frequency-set` cannot work from inside a VM, so clock variance is handled with the
-Windows power plan plus three repetitions and a median.
+And `cpupower frequency-set` cannot work from inside a VM, so clock variance is handled with three
+repetitions and a reported median.
+
+That handles variance *within* a run — measured at 1–3% for an `ef` sweep. It does not handle
+variance *between* runs, which on this machine is an order of magnitude larger: a bit-identical
+SIFT1M index measured 1.70× apart on two different days, with recall equal to four decimal places
+both times. The consequence is a methodological rule rather than a fix, since the host's frequency
+controls are not reachable from WSL2: **an A/B comparison builds both sides and runs them
+alternately in one session.** A figure carried over from an earlier session is a baseline for
+correctness, never for speed. Ratios measured back to back within one script — the hnswlib
+comparison, for instance — are unaffected, because the drift is common to both sides.
 
 ## 11. Reproducibility contract
 
