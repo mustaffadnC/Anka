@@ -295,9 +295,10 @@ fn measure<M: Metric>(
     let mut searcher = index.searcher();
     let mut build_counter = DistanceCounter::new();
 
+    let base_view = base.view();
     let start = Instant::now();
-    for vector in base.as_slice().chunks_exact(base.dim()) {
-        index.insert::<M>(&mut searcher, vector, &mut build_counter)?;
+    for position in 0..base.len() {
+        index.insert::<M>(&mut searcher, base_view.get(position), &mut build_counter)?;
     }
     let build_time = start.elapsed();
 

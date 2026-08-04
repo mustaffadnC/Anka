@@ -256,7 +256,7 @@ mod tests {
 
         assert_eq!(store.dim(), 4);
         assert_eq!(store.len(), 3);
-        assert_eq!(store.as_slice(), data.as_slice());
+        assert_eq!(store.as_contiguous().unwrap(), data.as_slice());
         assert_eq!(store.get(2), &[4.0, 4.5, 5.0, 5.5]);
     }
 
@@ -438,7 +438,7 @@ mod tests {
                 let store = read_fvecs(&path).expect("read");
                 prop_assert_eq!(store.dim(), dim);
                 prop_assert_eq!(store.len(), data.len() / dim);
-                prop_assert_eq!(store.as_slice(), data.as_slice());
+                prop_assert_eq!(store.as_contiguous().unwrap(), data.as_slice());
             }
 
             #[test]

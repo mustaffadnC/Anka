@@ -478,10 +478,12 @@ fn resolve_root(explicit: Option<PathBuf>) -> Result<PathBuf> {
 
 pub(crate) fn take_vectors(store: &VectorStore, count: usize) -> Result<VectorStore> {
     let dim = store.dim();
-    Ok(VectorStore::from_flat(
-        dim,
-        store.as_slice()[..count * dim].to_vec(),
-    )?)
+    let view = store.view();
+    let mut data = Vec::with_capacity(count * dim);
+    for position in 0..count {
+        data.extend_from_slice(view.get(position));
+    }
+    Ok(VectorStore::from_flat(dim, data)?)
 }
 
 pub(crate) fn take_rows(matrix: &IntMatrix, count: usize) -> Result<IntMatrix> {

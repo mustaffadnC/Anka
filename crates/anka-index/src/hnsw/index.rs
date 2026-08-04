@@ -5,7 +5,7 @@ use anka_core::{Candidate, Metric, MetricKind, NodeId, VectorStore};
 use crate::error::IndexError;
 use crate::hnsw::layer::Layer;
 use crate::hnsw::params::{HnswParams, MAX_LEVEL};
-use crate::hnsw::search::{Searcher, vector_at};
+use crate::hnsw::search::Searcher;
 use crate::hnsw::select::select_neighbors;
 use crate::hnsw::stats::DistanceCounter;
 
@@ -243,13 +243,12 @@ impl HnswIndex {
         ids.push(extra);
 
         let mut candidates = {
-            let data = self.vectors.as_slice();
-            let dim = self.vectors.dim();
-            let anchor = vector_at(data, dim, node);
+            let view = self.vectors.view();
+            let anchor = view.get(node as usize);
             ids.iter()
                 .map(|&id| {
                     counter.record(1);
-                    Candidate::new(M::distance(anchor, vector_at(data, dim, id)), id)
+                    Candidate::new(M::distance(anchor, view.get(id as usize)), id)
                 })
                 .collect::<Vec<_>>()
         };
@@ -379,7 +378,12 @@ mod tests {
 
     /// Fraction of the exact top-`k` that the index returned, averaged over queries.
     fn recall(index: &HnswIndex, queries: &[f32], dim: usize, k: usize, ef: usize) -> f64 {
-        let store = VectorStore::from_flat(dim, index.vectors().as_slice().to_vec()).unwrap();
+        let contiguous = index
+            .vectors()
+            .as_contiguous()
+            .expect("an index built in memory is contiguous")
+            .to_vec();
+        let store = VectorStore::from_flat(dim, contiguous).unwrap();
         let exact = BruteForceIndex::new(&store);
 
         let mut searcher = index.searcher();

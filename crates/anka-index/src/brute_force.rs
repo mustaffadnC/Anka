@@ -6,7 +6,7 @@
 
 use std::collections::BinaryHeap;
 
-use anka_core::{Candidate, Metric, NodeId, VectorError, VectorStore};
+use anka_core::{Candidate, Metric, NodeId, VectorError, VectorStore, Vectors};
 
 /// Which distance kernel a scan uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,15 +78,15 @@ impl<'a> BruteForceIndex<'a> {
             return Ok(Vec::new());
         }
 
-        // Hoisted: for a mapped store this is where the alignment check lives, and it has no
-        // business running once per candidate.
-        let data = self.vectors.as_slice();
+        // Resolved once: this is where the storage variant is decided, and it has no business
+        // being decided once per candidate.
+        let view = self.vectors.view();
 
         // Two call sites rather than a branch inside the loop, so each one monomorphises with
         // its kernel inlined.
         Ok(match kernel {
-            Kernel::Reference => scan(data, dim, query, k, M::distance_scalar),
-            Kernel::Fast => scan(data, dim, query, k, M::distance),
+            Kernel::Reference => scan(view, query, k, M::distance_scalar),
+            Kernel::Fast => scan(view, query, k, M::distance),
         })
     }
 
@@ -129,16 +129,16 @@ impl<'a> BruteForceIndex<'a> {
 /// `O(n log k)` in `O(k)` space. Collecting all distances and sorting would be `O(n log n)` and
 /// would need 4 MB of scratch per query on SIFT1M.
 fn scan(
-    data: &[f32],
-    dim: usize,
+    view: Vectors<'_>,
     query: &[f32],
     k: usize,
     distance: impl Fn(&[f32], &[f32]) -> f32,
 ) -> Vec<Candidate> {
     let mut heap: BinaryHeap<Candidate> = BinaryHeap::with_capacity(k);
+    let count = view.len();
 
-    for (index, vector) in data.chunks_exact(dim).enumerate() {
-        let candidate = Candidate::new(distance(query, vector), index as NodeId);
+    for index in 0..count {
+        let candidate = Candidate::new(distance(query, view.get(index)), index as NodeId);
 
         if heap.len() < k {
             heap.push(candidate);

@@ -52,12 +52,15 @@ pub fn compute<M: Metric>(
     }
 
     let index = BruteForceIndex::new(base);
-    let rows: Vec<Vec<i32>> = queries
-        .as_slice()
-        .par_chunks_exact(queries.dim())
-        .map(|query| {
+    // Indexed rather than chunked, so this works whether the query set is one contiguous buffer or
+    // a mapping with vectors appended after it. The per-query variant resolution is once per
+    // query, not once per candidate.
+    let queries_view = queries.view();
+    let rows: Vec<Vec<i32>> = (0..queries.len())
+        .into_par_iter()
+        .map(|position| {
             index
-                .search::<M>(query, k, kernel)
+                .search::<M>(queries_view.get(position), k, kernel)
                 .map(|found| found.iter().map(|c| c.id as i32).collect())
         })
         .collect::<Result<_, _>>()?;

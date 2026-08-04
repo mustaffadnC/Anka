@@ -37,7 +37,6 @@
 
 use anka_core::{Candidate, Metric, NodeId, VectorStore};
 
-use crate::hnsw::search::vector_at;
 use crate::hnsw::stats::DistanceCounter;
 
 /// How neighbours are chosen.
@@ -103,8 +102,7 @@ pub fn select_neighbors<M: Metric>(
         return candidates.iter().take(m).map(|c| c.id).collect();
     }
 
-    let data = vectors.as_slice();
-    let dim = vectors.dim();
+    let view = vectors.view();
 
     let mut selected: Vec<NodeId> = Vec::with_capacity(m);
     let mut pruned: Vec<NodeId> = Vec::new();
@@ -114,7 +112,7 @@ pub fn select_neighbors<M: Metric>(
             break;
         }
 
-        let candidate_vector = vector_at(data, dim, candidate.id);
+        let candidate_vector = view.get(candidate.id as usize);
 
         // Discard when some already-selected neighbour `r` is *closer to this candidate* than the
         // query is. Note what is being compared: dist(e, r) against dist(e, q) — not against
@@ -122,7 +120,7 @@ pub fn select_neighbors<M: Metric>(
         // is already sorted by exactly that.
         let dominated = selected.iter().any(|&r| {
             counter.record(1);
-            M::distance(candidate_vector, vector_at(data, dim, r)) < candidate.dist
+            M::distance(candidate_vector, view.get(r as usize)) < candidate.dist
         });
 
         if dominated {

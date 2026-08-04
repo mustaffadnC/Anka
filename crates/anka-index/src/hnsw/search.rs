@@ -73,14 +73,16 @@ impl Searcher {
             return Vec::new();
         }
 
-        let data = vectors.as_slice();
-        let dim = vectors.dim();
+        // Resolved once. Every access below indexes this rather than matching on the storage
+        // variant, which matters because a hybrid store — a snapshot with replayed vectors after
+        // it — is not one contiguous buffer.
+        let view = vectors.view();
 
         for &entry in entry_points {
             if !self.visited.visit(entry) {
                 continue;
             }
-            let candidate = Candidate::new(M::distance(query, vector_at(data, dim, entry)), entry);
+            let candidate = Candidate::new(M::distance(query, view.get(entry as usize)), entry);
             counter.record(1);
             self.candidates.push(Reverse(candidate));
             push_bounded(&mut self.results, candidate, ef);
@@ -104,7 +106,7 @@ impl Searcher {
                 }
 
                 let candidate =
-                    Candidate::new(M::distance(query, vector_at(data, dim, neighbor)), neighbor);
+                    Candidate::new(M::distance(query, view.get(neighbor as usize)), neighbor);
                 counter.record(1);
 
                 // Order matters: the length test comes first so an empty result set is never
@@ -146,12 +148,6 @@ fn push_bounded(results: &mut BinaryHeap<Candidate>, candidate: Candidate, ef: u
             *worst = candidate;
         }
     }
-}
-
-#[inline]
-pub(crate) fn vector_at(data: &[f32], dim: usize, node: NodeId) -> &[f32] {
-    let start = node as usize * dim;
-    &data[start..start + dim]
 }
 
 #[cfg(test)]
