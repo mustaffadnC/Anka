@@ -57,6 +57,13 @@ const HEADER_CHECKSUM_BYTES: usize = 124;
 
 pub const SECTION_COUNT: usize = 6;
 
+/// Alignment every section offset must satisfy.
+///
+/// 8 rather than 4: the sections hold `f32` and `u32` arrays today, but the id map is
+/// `(ExternalId u64, NodeId u32)` pairs, and a format that has to be re-aligned later is a format
+/// that breaks compatibility later.
+pub const SECTION_ALIGN: usize = 8;
+
 /// Sections of the snapshot body, in the order they are laid out.
 ///
 /// The order is fixed because the offsets are validated as non-decreasing, which is what turns a
@@ -320,11 +327,23 @@ impl SnapshotHeader {
             return Err(SnapshotError::InvalidEfConstruction);
         }
 
-        // Offsets are non-decreasing and inside the body. Together these two checks make every
-        // section a well-formed range, so the reader can slice without further arithmetic.
+        // Offsets are non-decreasing, aligned, and inside the body. Together these checks make
+        // every section a well-formed range, so the reader can slice without further arithmetic.
+        //
+        // Alignment is not cosmetic. Sections hold `u32` and `f32` arrays that the reader casts
+        // straight out of the mapping, and `bytemuck` *panics* on a misaligned cast. A corrupt
+        // offset would therefore take the process down — the one thing a corrupt file must never
+        // do. `SECTION_ALIGN` is 8 rather than 4 because the id map stores `(u64, u32)` pairs.
         let mut previous = 0u64;
         for section in Section::ALL {
             let offset = self.section_offsets[section.index()];
+            if !offset.is_multiple_of(SECTION_ALIGN as u64) {
+                return Err(SnapshotError::SectionMisaligned {
+                    section: section.name(),
+                    offset,
+                    align: SECTION_ALIGN,
+                });
+            }
             if offset < previous {
                 return Err(SnapshotError::SectionsOutOfOrder {
                     section: section.name(),
@@ -474,10 +493,10 @@ mod tests {
                 512_000_000,
                 512_001_000,
                 700_000_000,
-                700_000_100,
+                700_000_104,
                 700_000_200,
             ],
-            body_len: 700_000_300,
+            body_len: 700_000_304,
             body_crc32: 0x1234_5678,
             flags: HeaderFlags {
                 heuristic: true,
@@ -658,13 +677,32 @@ mod tests {
     #[test]
     fn malformed_section_offsets_are_rejected() {
         assert!(matches!(
-            SnapshotHeader::decode(&encode_with(|h| h.section_offsets[2] = 1)),
+            SnapshotHeader::decode(&encode_with(|h| h.section_offsets[2] = 8)),
             Err(SnapshotError::SectionsOutOfOrder { .. })
         ));
         assert!(matches!(
-            SnapshotHeader::decode(&encode_with(|h| h.section_offsets[5] = h.body_len + 1)),
+            SnapshotHeader::decode(&encode_with(
+                |h| h.section_offsets[5] = h.body_len + SECTION_ALIGN as u64
+            )),
             Err(SnapshotError::SectionOutOfRange { .. })
         ));
+    }
+
+    /// A misaligned offset is the one corrupt value that would *panic* rather than fail: the
+    /// reader casts sections straight out of the mapping, and `bytemuck` refuses to do that
+    /// unaligned. Every offset in the format is a multiple of [`SECTION_ALIGN`].
+    #[test]
+    fn misaligned_section_offsets_are_rejected() {
+        for index in 0..SECTION_COUNT {
+            let bytes = encode_with(|h| h.section_offsets[index] += 1);
+            assert!(
+                matches!(
+                    SnapshotHeader::decode(&bytes),
+                    Err(SnapshotError::SectionMisaligned { .. })
+                ),
+                "offset {index} was accepted one byte off alignment"
+            );
+        }
     }
 
     #[test]

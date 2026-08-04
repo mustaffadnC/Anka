@@ -9,10 +9,20 @@
 //!   so replay is both well-defined and deterministic
 //!
 //! Built in order: [`header`] first, because the format has to be pinned down before anything can
-//! be written into it.
+//! be written into it, then [`snapshot`] on top of it.
+
+// Sections are cast straight out of the mapping, which reads them in the host's byte order. The
+// format is little-endian by specification, so a big-endian host would read every array wrong and
+// checksum it right. Refusing to build is honest; a byte-swapping path nobody can test is not.
+#[cfg(target_endian = "big")]
+compile_error!("the snapshot format is little-endian; this target is big-endian");
 
 pub mod error;
 pub mod header;
+pub mod snapshot;
 
 pub use error::SnapshotError;
-pub use header::{FORMAT_VERSION, HEADER_BYTES, HeaderFlags, Section, SnapshotHeader};
+pub use header::{
+    FORMAT_VERSION, HEADER_BYTES, HeaderFlags, SECTION_ALIGN, Section, SnapshotHeader,
+};
+pub use snapshot::{Verify, load, write};

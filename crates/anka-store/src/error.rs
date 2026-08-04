@@ -65,6 +65,15 @@ pub enum SnapshotError {
         previous: u64,
     },
 
+    /// Sections are cast straight out of the mapping, and a misaligned cast panics. Rejecting the
+    /// offset is what keeps a corrupt file from taking the process down.
+    #[error("section {section} starts at {offset}, which is not {align}-byte aligned")]
+    SectionMisaligned {
+        section: &'static str,
+        offset: u64,
+        align: usize,
+    },
+
     #[error("section {section} starts at {offset}, past the {body_len}-byte body")]
     SectionOutOfRange {
         section: &'static str,
@@ -89,9 +98,29 @@ pub enum SnapshotError {
         expected: usize,
     },
 
+    /// A section's bytes are not a whole number of the elements it holds, or sit at an address
+    /// the target cannot read them from. Reachable only from a corrupt file, since the writer
+    /// pads every section — but "unreachable" is not something a reader of untrusted bytes gets
+    /// to assume.
+    #[error("section {section} cannot be read as {element}: {reason}")]
+    SectionNotCastable {
+        section: &'static str,
+        element: &'static str,
+        reason: bytemuck::PodCastError,
+    },
+
     #[error(transparent)]
     Vector(#[from] anka_core::VectorError),
 
     #[error(transparent)]
     Index(#[from] anka_index::IndexError),
+}
+
+impl SnapshotError {
+    pub(crate) fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
+        Self::Io {
+            path: path.into(),
+            source,
+        }
+    }
 }
