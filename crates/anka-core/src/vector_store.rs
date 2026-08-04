@@ -19,8 +19,103 @@ pub const MAX_DIM: usize = 4096;
 pub enum Storage {
     /// Built in memory: the insert and index-construction path.
     Owned(Vec<f32>),
-    /// Backed by a snapshot mapping and read without copying (used from phase 3).
+    /// Backed by a snapshot mapping and read without copying.
     Mapped { map: Mmap, offset: usize },
+    /// A snapshot mapping with vectors appended after it.
+    ///
+    /// This is what recovery produces. A snapshot is loaded read-only, then the write-ahead log
+    /// is replayed on top of it, and those replayed vectors have nowhere to go inside a read-only
+    /// mapping. The alternative was to copy the mapping into an owned buffer on the first write —
+    /// half a gigabyte on SIFT1M, paid by any collection that is ever written to, which would
+    /// defeat the entire point of mapping it.
+    Hybrid {
+        map: Mmap,
+        offset: usize,
+        /// Vectors `0..mapped_count` come from the mapping; the rest come from `owned`.
+        mapped_count: usize,
+        owned: Vec<f32>,
+    },
+}
+
+/// A borrowed view over a store's vectors, with the storage variant already resolved.
+///
+/// Hot loops take one of these once and then index it, rather than matching on [`Storage`] per
+/// access. `Contiguous` covers both owned and fully-mapped stores, so the common path — an index
+/// built in memory, which is every measurement in `docs/RESULTS.md` — costs a single
+/// well-predicted branch per vector.
+#[derive(Clone, Copy)]
+pub enum Vectors<'a> {
+    Contiguous {
+        data: &'a [f32],
+        dim: usize,
+    },
+    Split {
+        mapped: &'a [f32],
+        owned: &'a [f32],
+        dim: usize,
+        /// First index served by `owned`.
+        split: usize,
+    },
+}
+
+impl<'a> Vectors<'a> {
+    /// The vector at `index`.
+    ///
+    /// # Panics
+    ///
+    /// If `index` is out of range. Callers in the search path have already bounded their indices
+    /// by the graph, which only ever holds ids that exist.
+    #[inline]
+    pub fn get(&self, index: usize) -> &'a [f32] {
+        match *self {
+            Self::Contiguous { data, dim } => {
+                let start = index * dim;
+                &data[start..start + dim]
+            }
+            Self::Split {
+                mapped,
+                owned,
+                dim,
+                split,
+            } => {
+                if index < split {
+                    let start = index * dim;
+                    &mapped[start..start + dim]
+                } else {
+                    let start = (index - split) * dim;
+                    &owned[start..start + dim]
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub fn dim(&self) -> usize {
+        match *self {
+            Self::Contiguous { dim, .. } | Self::Split { dim, .. } => dim,
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        match *self {
+            Self::Contiguous { data, dim } => data.len() / dim,
+            Self::Split {
+                mapped, owned, dim, ..
+            } => (mapped.len() + owned.len()) / dim,
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Iterates over the vectors in storage order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &'a [f32]> + use<'a> {
+        let view = *self;
+        (0..view.len()).map(move |index| view.get(index))
+    }
 }
 
 /// A collection of equal-length fp32 vectors.
@@ -122,9 +217,34 @@ impl VectorStore {
         self.dim
     }
 
-    /// Whether this store reads through a memory mapping rather than owning its buffer.
+    /// Whether any of this store reads through a memory mapping.
     pub fn is_mapped(&self) -> bool {
-        matches!(self.storage, Storage::Mapped { .. })
+        matches!(
+            self.storage,
+            Storage::Mapped { .. } | Storage::Hybrid { .. }
+        )
+    }
+
+    /// How many vectors come from a mapping rather than from owned memory.
+    pub fn mapped_count(&self) -> usize {
+        match &self.storage {
+            Storage::Owned(_) => 0,
+            Storage::Mapped { .. } => self.count,
+            Storage::Hybrid { mapped_count, .. } => *mapped_count,
+        }
+    }
+
+    /// Bytes this store owns outright.
+    ///
+    /// Distinct from [`Self::data_bytes`], which counts the whole collection including whatever is
+    /// only mapped. Phase 5's memory claim is about resident bytes specifically, so the two are
+    /// separate methods rather than one number that has to be explained.
+    pub fn resident_bytes(&self) -> usize {
+        match &self.storage {
+            Storage::Owned(data) => data.capacity() * size_of::<f32>(),
+            Storage::Mapped { .. } => 0,
+            Storage::Hybrid { owned, .. } => owned.capacity() * size_of::<f32>(),
+        }
     }
 
     /// Size of the vector data in bytes.
@@ -136,32 +256,58 @@ impl VectorStore {
         self.count * self.dim * size_of::<f32>()
     }
 
-    /// The entire buffer as one flat slice.
-    ///
-    /// Hoist this out of hot loops instead of calling [`Self::get`] per candidate: for the
-    /// mapped variant it repeats an alignment check the constructor already guaranteed.
-    /// Whether removing that check with a documented `unsafe` is worth it is a question for
-    /// phase 2, when there is a profile to answer it with.
+    /// A view with the storage variant resolved. Hoist this out of hot loops.
     #[inline]
-    pub fn as_slice(&self) -> &[f32] {
+    pub fn view(&self) -> Vectors<'_> {
         match &self.storage {
-            Storage::Owned(data) => data,
+            Storage::Owned(data) => Vectors::Contiguous {
+                data,
+                dim: self.dim,
+            },
+            Storage::Mapped { map, offset } => Vectors::Contiguous {
+                data: mapped_slice(map, *offset, self.count, self.dim),
+                dim: self.dim,
+            },
+            Storage::Hybrid {
+                map,
+                offset,
+                mapped_count,
+                owned,
+            } => Vectors::Split {
+                mapped: mapped_slice(map, *offset, *mapped_count, self.dim),
+                owned,
+                dim: self.dim,
+                split: *mapped_count,
+            },
+        }
+    }
+
+    /// The whole collection as one flat slice, when it happens to be contiguous.
+    ///
+    /// `None` for a hybrid store, where the vectors live in two places by construction. Callers
+    /// that genuinely need one buffer — writing a snapshot, slicing a prefix — handle the `None`;
+    /// callers that only need to read vectors should use [`Self::view`] instead and never care.
+    #[inline]
+    pub fn as_contiguous(&self) -> Option<&[f32]> {
+        match &self.storage {
+            Storage::Owned(data) => Some(data),
             Storage::Mapped { map, offset } => {
-                let end = offset + self.count * self.dim * size_of::<f32>();
-                bytemuck::cast_slice(&map[*offset..end])
+                Some(mapped_slice(map, *offset, self.count, self.dim))
             }
+            Storage::Hybrid { .. } => None,
         }
     }
 
     /// The entire buffer as one mutable flat slice.
     ///
-    /// Owned storage only — a memory mapping is opened read-only, and the insert path never
-    /// writes through one. Used by [`crate::preprocess_all`] to normalise in place instead of
-    /// copying half a gigabyte to do it.
+    /// Owned storage only. A mapping is opened read-only, and a hybrid store is only half
+    /// writable — normalising one in place would silently skip the mapped half, which is exactly
+    /// the kind of half-applied transformation that produces a plausible, wrong recall figure.
+    /// Used by [`crate::preprocess_all`] to normalise without copying half a gigabyte.
     pub fn as_mut_slice(&mut self) -> Result<&mut [f32], VectorError> {
         match &mut self.storage {
             Storage::Owned(data) => Ok(data),
-            Storage::Mapped { .. } => Err(VectorError::ReadOnlyStorage),
+            Storage::Mapped { .. } | Storage::Hybrid { .. } => Err(VectorError::ReadOnlyStorage),
         }
     }
 
@@ -169,11 +315,11 @@ impl VectorStore {
     ///
     /// # Panics
     ///
-    /// If `index >= self.len()`. Use [`Self::try_get`] where the index comes from outside.
+    /// If `index >= self.len()`. Use [`Self::try_get`] where the index comes from outside, and
+    /// [`Self::view`] in a loop — this resolves the storage variant on every call.
     #[inline]
     pub fn get(&self, index: usize) -> &[f32] {
-        let start = index * self.dim;
-        &self.as_slice()[start..start + self.dim]
+        self.view().get(index)
     }
 
     #[inline]
@@ -183,10 +329,14 @@ impl VectorStore {
 
     /// Iterates over the vectors in storage order.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &[f32]> {
-        self.as_slice().chunks_exact(self.dim)
+        self.view().iter()
     }
 
-    /// Appends a vector. Owned storage only.
+    /// Appends a vector.
+    ///
+    /// A fully mapped store becomes hybrid on the first push: the mapping stays where it is and
+    /// the new vector goes into a fresh owned buffer beside it. That transition is what makes
+    /// "load a snapshot, then replay the log on top of it" possible without copying the snapshot.
     pub fn push(&mut self, vector: &[f32]) -> Result<(), VectorError> {
         if vector.len() != self.dim {
             return Err(VectorError::DimMismatch {
@@ -203,21 +353,62 @@ impl VectorStore {
         }
         check_count(self.count + 1)?;
 
-        match &mut self.storage {
-            Storage::Owned(data) => {
+        // `take` so the mapping can be moved into the new variant; the store is left momentarily
+        // holding an empty owned buffer, which nothing can observe from inside this method.
+        let storage = std::mem::replace(&mut self.storage, Storage::Owned(Vec::new()));
+        self.storage = match storage {
+            Storage::Owned(mut data) => {
                 data.extend_from_slice(vector);
-                self.count += 1;
-                Ok(())
+                Storage::Owned(data)
             }
-            Storage::Mapped { .. } => Err(VectorError::ReadOnlyStorage),
-        }
+            Storage::Mapped { map, offset } => Storage::Hybrid {
+                map,
+                offset,
+                mapped_count: self.count,
+                owned: vector.to_vec(),
+            },
+            Storage::Hybrid {
+                map,
+                offset,
+                mapped_count,
+                mut owned,
+            } => {
+                owned.extend_from_slice(vector);
+                Storage::Hybrid {
+                    map,
+                    offset,
+                    mapped_count,
+                    owned,
+                }
+            }
+        };
+        self.count += 1;
+        Ok(())
     }
 
     /// Scans for NaN and infinity. See [`Self::from_mmap`] for why this is not automatic
     /// there.
     pub fn validate_finite(&self) -> Result<(), VectorError> {
-        validate_finite(self.as_slice(), self.dim, 0)
+        match self.as_contiguous() {
+            Some(data) => validate_finite(data, self.dim, 0),
+            None => {
+                let view = self.view();
+                for index in 0..self.count {
+                    validate_finite(view.get(index), self.dim, index)?;
+                }
+                Ok(())
+            }
+        }
     }
+}
+
+/// Reinterprets `count` vectors starting `offset` bytes into a mapping.
+///
+/// The constructor has already checked alignment and size, so `cast_slice` cannot fail here.
+#[inline]
+fn mapped_slice(map: &Mmap, offset: usize, count: usize, dim: usize) -> &[f32] {
+    let end = offset + count * dim * size_of::<f32>();
+    bytemuck::cast_slice(&map[offset..end])
 }
 
 impl std::fmt::Debug for VectorStore {
@@ -227,8 +418,13 @@ impl std::fmt::Debug for VectorStore {
             .field("count", &self.count)
             .field(
                 "storage",
-                &if self.is_mapped() { "mapped" } else { "owned" },
+                &match &self.storage {
+                    Storage::Owned(_) => "owned",
+                    Storage::Mapped { .. } => "mapped",
+                    Storage::Hybrid { .. } => "hybrid",
+                },
             )
+            .field("mapped_count", &self.mapped_count())
             .finish()
     }
 }
@@ -406,16 +602,124 @@ mod tests {
         assert_eq!(store.len(), 2);
         assert_eq!(store.get(0), &[1.0, 2.0, 3.0]);
         assert_eq!(store.get(1), &[4.0, 5.0, 6.0]);
-        assert_eq!(store.as_slice(), &values);
+        assert_eq!(store.as_contiguous().unwrap(), &values);
+    }
+
+    /// The transition that makes recovery possible: a snapshot is mapped read-only, then the
+    /// write-ahead log is replayed on top of it. Pushing does not copy the mapping — it opens an
+    /// owned buffer beside it.
+    #[test]
+    fn pushing_to_a_mapped_store_makes_it_hybrid() {
+        let mut store = mapped_store(128, 2, &[1.0, 2.0, 3.0, 4.0]).expect("valid mapping");
+        assert_eq!(store.mapped_count(), 2);
+        assert_eq!(store.resident_bytes(), 0);
+
+        store.push(&[5.0, 6.0]).expect("push onto a mapping");
+
+        assert_eq!(store.len(), 3);
+        assert_eq!(store.mapped_count(), 2, "the mapping was not copied");
+        assert!(store.resident_bytes() > 0, "the new vector is resident");
+        assert!(store.is_mapped());
+    }
+
+    /// Reads have to cross the split without noticing it.
+    #[test]
+    fn a_hybrid_store_reads_across_the_split() {
+        let mut store = mapped_store(128, 2, &[1.0, 2.0, 3.0, 4.0]).expect("valid mapping");
+        store.push(&[5.0, 6.0]).unwrap();
+        store.push(&[7.0, 8.0]).unwrap();
+
+        // Last mapped, first owned, and everything either side.
+        assert_eq!(store.get(0), &[1.0, 2.0]);
+        assert_eq!(store.get(1), &[3.0, 4.0]);
+        assert_eq!(store.get(2), &[5.0, 6.0]);
+        assert_eq!(store.get(3), &[7.0, 8.0]);
+        assert_eq!(store.try_get(4), None);
+
+        let rows: Vec<&[f32]> = store.iter().collect();
+        assert_eq!(
+            rows,
+            vec![
+                &[1.0, 2.0][..],
+                &[3.0, 4.0][..],
+                &[5.0, 6.0][..],
+                &[7.0, 8.0][..]
+            ]
+        );
+
+        let view = store.view();
+        assert_eq!(view.len(), 4);
+        assert_eq!(view.dim(), 2);
+        assert_eq!(view.get(2), &[5.0, 6.0]);
+    }
+
+    /// A hybrid store is two buffers by construction, so there is no single slice to hand out.
+    #[test]
+    fn a_hybrid_store_has_no_contiguous_slice() {
+        let mut store = mapped_store(128, 2, &[1.0, 2.0]).expect("valid mapping");
+        assert!(store.as_contiguous().is_some());
+        store.push(&[3.0, 4.0]).unwrap();
+        assert!(store.as_contiguous().is_none());
+    }
+
+    /// Normalising in place would silently skip the mapped half, which is the kind of
+    /// half-applied transformation that yields a plausible, wrong recall figure.
+    #[test]
+    fn neither_mapped_nor_hybrid_storage_is_mutable() {
+        let mut store = mapped_store(128, 2, &[1.0, 2.0]).expect("valid mapping");
+        assert!(matches!(
+            store.as_mut_slice(),
+            Err(VectorError::ReadOnlyStorage)
+        ));
+
+        store.push(&[3.0, 4.0]).unwrap();
+        assert!(matches!(
+            store.as_mut_slice(),
+            Err(VectorError::ReadOnlyStorage)
+        ));
+    }
+
+    /// Two different paths through `validate_finite`, so both are exercised.
+    ///
+    /// A hybrid store has no contiguous slice, so the check walks it vector by vector — that path
+    /// is covered here by a clean store. The reported-index behaviour is covered on a mapped store
+    /// instead, because `push` refuses a non-finite vector and there is no way to get one into the
+    /// owned half without bypassing it.
+    #[test]
+    fn finiteness_is_checked_on_both_storage_paths() {
+        let mut hybrid = mapped_store(128, 2, &[1.0, 2.0, 3.0, 4.0]).expect("valid mapping");
+        hybrid.push(&[5.0, 6.0]).unwrap();
+        assert!(
+            hybrid.as_contiguous().is_none(),
+            "exercising the split path"
+        );
+        assert!(hybrid.validate_finite().is_ok());
+
+        let bad = mapped_store(0, 2, &[1.0, 2.0, f32::NAN, 4.0]).expect("shape is valid");
+        match bad.validate_finite() {
+            Err(VectorError::NonFinite {
+                vector, component, ..
+            }) => assert_eq!((vector, component), (1, 0)),
+            other => panic!("expected NonFinite at vector 1, got {other:?}"),
+        }
     }
 
     #[test]
-    fn mapped_storage_is_read_only() {
+    fn push_rejects_bad_input_on_a_hybrid_store_too() {
+        // One mapped vector, then one pushed: the store is hybrid and holds two.
         let mut store = mapped_store(128, 2, &[1.0, 2.0]).expect("valid mapping");
+        store.push(&[3.0, 4.0]).unwrap();
+        assert_eq!(store.len(), 2);
+
         assert!(matches!(
-            store.push(&[3.0, 4.0]),
-            Err(VectorError::ReadOnlyStorage)
+            store.push(&[1.0]),
+            Err(VectorError::DimMismatch { .. })
         ));
+        assert!(matches!(
+            store.push(&[1.0, f32::NAN]),
+            Err(VectorError::NonFinite { component: 1, .. })
+        ));
+        assert_eq!(store.len(), 2, "a rejected push must not advance the store");
     }
 
     #[test]

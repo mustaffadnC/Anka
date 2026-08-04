@@ -25,7 +25,7 @@ pub mod vector_store;
 pub use candidate::Candidate;
 pub use error::{DatasetError, VectorError};
 pub use metric::{Cosine, DotProduct, L2Squared, Metric, MetricKind, preprocess_all};
-pub use vector_store::{MAX_DIM, Storage, VectorStore};
+pub use vector_store::{MAX_DIM, Storage, VectorStore, Vectors};
 
 /// Identifier supplied by the caller. Stable for the lifetime of a vector.
 ///
