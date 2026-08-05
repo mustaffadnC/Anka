@@ -175,22 +175,30 @@ impl WalWriter {
     /// Used by `anka checkpoint`: once a snapshot is durable, the records it contains are no
     /// longer needed. `first_seq` is where numbering continues, so sequence numbers stay
     /// monotonic across the truncation and a stale log cannot be mistaken for a current one.
+    ///
+    /// **Replaced, not emptied.** The new log is built under a temporary name and renamed into
+    /// place, the same dance the snapshot writer does. Truncating in place leaves a window where
+    /// a crash finds a file that is neither the old log nor a valid new one, and that window sits
+    /// immediately after a checkpoint — the moment a collection is least able to afford it.
     pub fn create(path: &Path, policy: SyncPolicy, first_seq: u64) -> Result<Self, WalError> {
+        let tmp = temp_path(path);
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(path)
-            .map_err(|e| WalError::io(path, e))?;
+            .open(&tmp)
+            .map_err(|e| WalError::io(&tmp, e))?;
 
         let mut header = [0u8; HEADER_BYTES];
         header[..4].copy_from_slice(&MAGIC);
         header[4..8].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
-        file.write_all(&header).map_err(|e| WalError::io(path, e))?;
-        file.sync_all().map_err(|e| WalError::io(path, e))?;
-        // The file may be new, so its directory entry has to be durable too.
+        file.write_all(&header).map_err(|e| WalError::io(&tmp, e))?;
+        file.sync_all().map_err(|e| WalError::io(&tmp, e))?;
+
+        std::fs::rename(&tmp, path).map_err(|e| WalError::io(path, e))?;
         crate::fsync::parent_directory(path).map_err(|e| WalError::io(path, e))?;
 
+        // The handle survives the rename: it refers to the inode, which now has this name.
         Ok(Self {
             file,
             path: path.to_path_buf(),
@@ -495,6 +503,12 @@ fn decode_insert(seq: u64, payload: &[u8], dim: usize) -> Result<Record, WalErro
         vector,
         metadata,
     })
+}
+
+fn temp_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    path.with_file_name(name)
 }
 
 fn payload_u64(seq: u64, op: u8, payload: &[u8]) -> Result<u64, WalError> {

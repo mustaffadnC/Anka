@@ -9,8 +9,8 @@
 //!   so replay is both well-defined and deterministic
 //!
 //! Built in order: [`header`] first, because the format has to be pinned down before anything can
-//! be written into it, then [`snapshot`] on top of it, then [`wal`], then [`recovery`] joining
-//! the two.
+//! be written into it, then [`snapshot`] on top of it, then [`wal`], then [`recovery`] joining the
+//! two, and [`collection`] putting the ordering rule somewhere nobody has to remember it.
 
 // Sections are cast straight out of the mapping, which reads them in the host's byte order. The
 // format is little-endian by specification, so a big-endian host would read every array wrong and
@@ -18,6 +18,7 @@
 #[cfg(target_endian = "big")]
 compile_error!("the snapshot format is little-endian; this target is big-endian");
 
+pub mod collection;
 pub mod error;
 mod fsync;
 pub mod header;
@@ -25,6 +26,7 @@ pub mod recovery;
 pub mod snapshot;
 pub mod wal;
 
+pub use collection::{Collection, Opened};
 pub use error::{RecoveryError, SnapshotError, WalError};
 pub use header::{
     FORMAT_VERSION, HEADER_BYTES, HeaderFlags, SECTION_ALIGN, Section, SnapshotHeader,

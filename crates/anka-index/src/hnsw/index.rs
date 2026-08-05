@@ -203,6 +203,19 @@ impl HnswIndex {
         })
     }
 
+    /// Draws the level the next node would be inserted at.
+    ///
+    /// Exposed because a durable insert has to record the level *before* it applies it: the log
+    /// entry is written and synced first, and it has to carry the same level the index will use.
+    /// Drawing inside [`Self::insert`] would make that impossible without a second draw, which
+    /// would put the generator out of step with what the log says.
+    ///
+    /// Every call advances the generator, so a drawn level that is then not inserted still counts
+    /// — which is correct, since the snapshot records the draw count and replay must reproduce it.
+    pub fn draw_level(&mut self) -> usize {
+        self.levels.next_level()
+    }
+
     /// Inserts `vector`, drawing its level from the seeded generator.
     pub fn insert<M: Metric>(
         &mut self,
@@ -210,7 +223,7 @@ impl HnswIndex {
         vector: &[f32],
         counter: &mut DistanceCounter,
     ) -> Result<NodeId, IndexError> {
-        let level = self.levels.next_level();
+        let level = self.draw_level();
         self.insert_at_level::<M>(searcher, vector, level, counter)
     }
 
