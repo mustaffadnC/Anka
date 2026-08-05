@@ -70,12 +70,15 @@ pub fn write(index: &HnswIndex, path: &Path, wal_seq: u64) -> Result<(), Snapsho
         .open(&tmp)
         .map_err(|e| SnapshotError::io(&tmp, e))?;
 
+    // The header carries the body's checksum, so it cannot be written until the body has been
+    // hashed. Its space is reserved here and filled in below — and reserved *outside* the
+    // checksumming writer, so that writer hashes exactly what it is handed and nothing has to
+    // reason about where the header ended.
+    file.write_all(&[0u8; HEADER_BYTES])
+        .map_err(|e| SnapshotError::io(&tmp, e))?;
+
     let body_crc32 = {
         let mut out = CrcWriter::new(BufWriter::new(&mut file));
-        // The header's checksum covers fields that are only known once the body has been hashed,
-        // so its bytes are placed at the end. Reserving the space keeps the body at offset 128.
-        out.write_all(&[0u8; HEADER_BYTES])
-            .map_err(|e| SnapshotError::io(&tmp, e))?;
         write_body(&mut out, index, &layout).map_err(|e| SnapshotError::io(&tmp, e))?;
         out.finish().map_err(|e| SnapshotError::io(&tmp, e))?
     };
@@ -99,6 +102,10 @@ pub fn write(index: &HnswIndex, path: &Path, wal_seq: u64) -> Result<(), Snapsho
 /// The vectors are *not* copied: they stay in the mapping and are paged in on demand. Everything
 /// else — levels, adjacency — is copied, because the in-memory graph owns its arrays and mutating
 /// a read-only mapping is not a thing.
+///
+/// This returns almost immediately regardless of file size; the cost of touching the vectors is
+/// deferred to the queries that touch them. [`read`] is the other end of that trade, and
+/// `anka snapshot` measures both.
 pub fn load(path: &Path, verify: Verify) -> Result<HnswIndex, SnapshotError> {
     let file = File::open(path).map_err(|e| SnapshotError::io(path, e))?;
     // Safety: the mapping is read-only and lives as long as the store built from it. A concurrent
@@ -106,16 +113,77 @@ pub fn load(path: &Path, verify: Verify) -> Result<HnswIndex, SnapshotError> {
     // under a temporary name and renamed into place rather than modified where it lies.
     let map = unsafe { Mmap::map(&file) }.map_err(|e| SnapshotError::io(path, e))?;
 
-    let header = SnapshotHeader::decode(&map)?;
+    let parsed = parse(&map, verify)?;
+    let vectors = VectorStore::from_mmap(
+        map,
+        HEADER_BYTES + parsed.vectors_start,
+        parsed.dim,
+        parsed.count,
+    )?;
+    parsed.into_index(vectors)
+}
+
+/// Reads a snapshot into owned memory and rebuilds the index from it.
+///
+/// The alternative to [`load`], and the reason it exists: reading pays for every byte up front,
+/// where mapping pays per page on first touch. Which is faster depends entirely on how much of the
+/// collection a workload actually visits — a graph search visits very little of it, which is the
+/// whole argument for mapping. Having both makes that an experiment rather than an assertion.
+pub fn read(path: &Path, verify: Verify) -> Result<HnswIndex, SnapshotError> {
+    let bytes = std::fs::read(path).map_err(|e| SnapshotError::io(path, e))?;
+
+    let parsed = parse(&bytes, verify)?;
+    let start = HEADER_BYTES + parsed.vectors_start;
+    let floats: &[f32] = bytemuck::try_cast_slice(
+        &bytes[start..start + parsed.count * parsed.dim * size_of::<f32>()],
+    )
+    .map_err(|reason| SnapshotError::SectionNotCastable {
+        section: Section::Vectors.name(),
+        element: "f32",
+        reason,
+    })?;
+    let vectors = VectorStore::from_flat(parsed.dim, floats.to_vec())?;
+    parsed.into_index(vectors)
+}
+
+/// Everything decoded from a snapshot except the vectors, which the two loaders obtain differently.
+struct Parsed {
+    header: SnapshotHeader,
+    params: HnswParams,
+    node_levels: Vec<u8>,
+    layers: Vec<Layer>,
+    /// Body-relative offset of the vectors section.
+    vectors_start: usize,
+    count: usize,
+    dim: usize,
+}
+
+impl Parsed {
+    fn into_index(self, vectors: VectorStore) -> Result<HnswIndex, SnapshotError> {
+        Ok(HnswIndex::from_parts(IndexParts {
+            vectors,
+            params: self.params,
+            metric: self.header.metric,
+            layers: self.layers,
+            node_levels: self.node_levels,
+            entry_point: self.header.entry_point,
+            max_layer: self.header.max_layer as usize,
+            levels_drawn: self.header.levels_drawn,
+        })?)
+    }
+}
+
+fn parse(bytes: &[u8], verify: Verify) -> Result<Parsed, SnapshotError> {
+    let header = SnapshotHeader::decode(bytes)?;
     let body_end = HEADER_BYTES as u64 + header.body_len;
-    if (map.len() as u64) < body_end {
+    if (bytes.len() as u64) < body_end {
         return Err(SnapshotError::BodyTruncated {
-            file_len: map.len() as u64,
+            file_len: bytes.len() as u64,
             body_len: header.body_len,
             header_len: HEADER_BYTES,
         });
     }
-    let body = &map[HEADER_BYTES..body_end as usize];
+    let body = &bytes[HEADER_BYTES..body_end as usize];
 
     if verify == Verify::Body {
         let computed = crc32(body);
@@ -131,25 +199,19 @@ pub fn load(path: &Path, verify: Verify) -> Result<HnswIndex, SnapshotError> {
     let dim = header.dim as usize;
     let params = params_from(&header)?;
 
-    // Everything the graph needs is copied out here, before the mapping is handed to the store.
     let node_levels = section(body, &header, Section::NodeLevels, count)?.to_vec();
     let layers = read_layers(body, &header, &params, count)?;
-
-    // The vectors are the one section not copied: their offset is handed to the store, which
-    // reads them straight out of the mapping.
     let vectors_start = section_start(&header, Section::Vectors, count * dim * size_of::<f32>())?;
-    let vectors = VectorStore::from_mmap(map, HEADER_BYTES + vectors_start, dim, count)?;
 
-    Ok(HnswIndex::from_parts(IndexParts {
-        vectors,
+    Ok(Parsed {
+        header,
         params,
-        metric: header.metric,
-        layers,
         node_levels,
-        entry_point: header.entry_point,
-        max_layer: header.max_layer as usize,
-        levels_drawn: header.levels_drawn,
-    })?)
+        layers,
+        vectors_start,
+        count,
+        dim,
+    })
 }
 
 /// Where each section starts, and how long the body is.
@@ -457,9 +519,9 @@ impl<W: Write> CrcWriter<W> {
         }
     }
 
-    /// Bytes of *body* written so far. The reserved header does not count towards it.
+    /// Bytes written so far. The writer is handed the body only, so this is a body offset.
     fn written(&self) -> u64 {
-        self.written - HEADER_BYTES as u64
+        self.written
     }
 
     /// Zero-fills up to `body_offset`, so the next section starts where the header says it does.
@@ -478,11 +540,7 @@ impl<W: Write> CrcWriter<W> {
 impl<W: Write> Write for CrcWriter<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let n = self.inner.write(buf)?;
-        // The reserved header bytes are written through here too but must not be hashed: the
-        // header carries this checksum, so including it would make the value depend on itself.
-        if self.written >= HEADER_BYTES as u64 {
-            self.hasher.update(&buf[..n]);
-        }
+        self.hasher.update(&buf[..n]);
         self.written += n as u64;
         Ok(n)
     }
@@ -498,27 +556,9 @@ fn temp_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// Makes the rename durable.
-///
-/// `rename` is atomic, but the directory entry it creates lives in the directory's own metadata,
-/// which is not on disk until the directory is synced. Skipping this leaves a window where a
-/// crash reverts to the previous snapshot despite the new one being complete — the failure this
-/// step exists for, and the one most often left out.
-#[cfg(unix)]
+/// Makes the rename durable. See [`crate::fsync::parent_directory`] for why this step matters.
 fn sync_parent_directory(path: &Path) -> Result<(), SnapshotError> {
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
-    let dir = parent.unwrap_or_else(|| Path::new("."));
-    File::open(dir)
-        .and_then(|f| f.sync_all())
-        .map_err(|e| SnapshotError::io(dir, e))
-}
-
-/// Windows has no directory handle to sync, and `rename` over an existing file is not atomic
-/// there either. The project builds and measures on Linux; on other targets a snapshot is written
-/// correctly but its durability across a crash is **not** claimed.
-#[cfg(not(unix))]
-fn sync_parent_directory(_path: &Path) -> Result<(), SnapshotError> {
-    Ok(())
+    crate::fsync::parent_directory(path).map_err(|e| SnapshotError::io(path, e))
 }
 
 #[cfg(test)]
@@ -651,6 +691,51 @@ mod tests {
                 &data[position * dim..(position + 1) * dim]
             );
         }
+    }
+
+    /// The two loaders differ only in where the vectors end up. Everything they produce — the
+    /// graph, the answers, the distances — has to be identical, or the comparison `anka snapshot`
+    /// reports would be measuring two different indexes.
+    #[test]
+    fn reading_and_mapping_produce_the_same_index() {
+        let dim = 8;
+        let data = points(17, 1_000, dim);
+        let queries = points(18, 40, dim);
+        let original = build(HnswParams::default(), &data, dim);
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("c.anka");
+        write(&original, &path, 0).unwrap();
+
+        let mapped = load(&path, Verify::Body).unwrap();
+        let owned = read(&path, Verify::Body).unwrap();
+
+        assert!(mapped.vectors().is_mapped());
+        assert!(!owned.vectors().is_mapped());
+        assert_eq!(owned.vectors().resident_bytes(), data.len() * 4);
+
+        assert_same_graph(&mapped, &owned);
+        assert_same_answers(&mapped, &owned, &queries, dim);
+        assert_same_answers(&original, &owned, &queries, dim);
+    }
+
+    /// Reading is the same parser, so it has to reject the same files.
+    #[test]
+    fn reading_rejects_what_mapping_rejects() {
+        let dim = 4;
+        let index = build(HnswParams::default(), &points(19, 100, dim), dim);
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("c.anka");
+        write(&index, &path, 0).unwrap();
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[HEADER_BYTES + 8] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(matches!(
+            read(&path, Verify::Body),
+            Err(SnapshotError::BodyChecksumMismatch { .. })
+        ));
     }
 
     /// Every parameter that changes the graph's shape has to come back, or a reloaded index would

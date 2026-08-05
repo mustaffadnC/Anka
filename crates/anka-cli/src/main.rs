@@ -18,6 +18,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
 mod bench;
+mod snapshot;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -38,6 +39,8 @@ enum Command {
     Gt(GroundTruthArgs),
     /// Build an HNSW index, then sweep `ef` measuring recall and throughput.
     Bench(bench::BenchArgs),
+    /// Write an index to disk, load it back both ways, and check the answers are unchanged.
+    Snapshot(snapshot::SnapshotArgs),
 }
 
 #[derive(Args, Debug)]
@@ -141,6 +144,7 @@ fn main() -> Result<()> {
         Command::Load(args) => load(args),
         Command::Gt(args) => check_ground_truth(args),
         Command::Bench(args) => bench::run(args),
+        Command::Snapshot(args) => snapshot::run(args),
     }
 }
 
