@@ -660,17 +660,64 @@ the same inner loop — moved 1.6%, also nothing.
 This is what phase 5's quantization claims will have to clear, and the reason a microbenchmark
 alone will not be accepted as evidence for them.
 
+### The round trip through disk — SIFT1M
+
+`anka snapshot sift1m --queries 1000`. The index is built, written, loaded back both ways, and
+every query is compared in full: same ids, same order, bit-identical distances. Not recall — recall
+is an average and would hide a graph that came back subtly different.
+
+The reloaded graph is the same graph: 1 000 000 nodes and 26 760 362 edges over 5 layers, matching
+the phase 2 build exactly, and `validate()` passes on it. **All 1 000 queries answered identically
+through both loaders.**
+
+| | open | first queries | repeat | resident |
+|---|---|---|---|---|
+| mapped | 87.2 ms | 286.7 ms | 207.5 ms | **289.0 MiB** |
+| fully read | 1.10 s | 299.0 ms | — | 645.8 MiB |
+| mapped, body checksummed | 146.7 ms | — | — | 777.2 MiB |
+
+Writing 619.7 MiB takes 758.8 ms including both `fsync` calls — 817 MiB/s.
+
+**Mapping wins on both axes, and the reason is visible in the table.** Opening is 12.6× faster
+because nothing is copied. The cost it defers shows up as the gap between the first query pass and
+the second: 286.7 − 207.5 = **79 ms of paging**, against the 1.10 s that reading spent pulling in
+the whole file. A graph search touches a small, scattered part of a collection, so paying for all
+of it up front buys mostly bytes no query will look at. Resident memory says the same thing:
+289.0 MiB against 645.8 MiB, a 2.2× difference that is entirely the vectors.
+
+Query speed itself is unaffected by which loader produced the index — 286.7 ms mapped against
+299.0 ms read, both cold — which is the same conclusion the hybrid-storage A/B reached from the
+other direction.
+
+**The third row is the argument for the two-checksum policy, stated as a measurement.** Verifying
+the body costs 59 ms more at open, which is cheap. What it actually costs is 777.2 MiB resident
+against 289.0: checksumming reads every byte, so the entire file becomes resident and the lazy
+mapping is undone. That is why `Verify::Body` is opt-in and why the load figures above are measured
+without it.
+
+**Caveat, stated because it changes how these numbers should be read.** The file was written moments
+before it was loaded, so it is in the page cache throughout. This is the realistic shape for
+checkpoint-then-continue, and it is *not* a cold process start — there, both loaders would add real
+disk I/O and the ratio would move. Dropping the cache needs root, which this measurement harness
+does not take. The resident-memory figures are unaffected by cache state.
+
 ### Durability
 
 | Check | Result |
 |---|---|
-| 1M index write → reload, results bit-identical | *pending* |
+| 1M index write → reload, results bit-identical | **1 000/1 000 queries, ids and distances** |
+| mmap load time vs full read | **87.2 ms vs 1.10 s; 289.0 MiB vs 645.8 MiB resident** |
+| Corrupt snapshot: truncation, flipped bit, foreign file | **every case an `Err`, no panic** |
+| Torn WAL: truncated `len` / truncated payload / bad CRC | **byte-exhaustive at record level** |
 | WAL replay path, results bit-identical | *pending* |
-| mmap load time vs full read | *pending* |
+| Torn WAL: `seq` gap | *pending* |
 | `kill -9` during WAL write, `fsync=always` | *pending* |
 | `kill -9` during snapshot write | *pending* |
-| Torn WAL: truncated `len` / truncated payload / bad CRC / `seq` gap | *pending* |
-| Corrupt snapshot: bad magic / unknown version / bad header CRC | *pending* |
+
+The snapshot corruption row is exhaustive rather than sampled: the test flips **each** of the 128
+header bytes in turn and requires every one to be rejected, and truncates the file at every length
+that could still carry a header. The torn-WAL row is the same shape — every prefix length of a
+record's framing and payload, and every single-bit flip across a whole record.
 
 **What the crash test proves:** recovery survives a torn log and an interrupted snapshot, and no
 record acknowledged under `fsync=always` is lost to a process kill.
