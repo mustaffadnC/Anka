@@ -124,3 +124,66 @@ impl SnapshotError {
         }
     }
 }
+
+/// A write-ahead log could not be written or read.
+///
+/// Separate from [`SnapshotError`] because the two failure modes barely overlap: a snapshot is
+/// wrong or it is not, while a log is expected to end mid-record and the interesting question is
+/// whether that ending is a torn tail — which is normal — or a log this build cannot read, which
+/// is not. Only the second kind reaches this type; see [`crate::wal::Torn`] for the first.
+#[derive(Debug, thiserror::Error)]
+pub enum WalError {
+    #[error("{path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("file holds {got} bytes, fewer than the {needed}-byte log header")]
+    TooShort { needed: usize, got: usize },
+
+    #[error("not an Anka write-ahead log: magic is {found:?}, expected \"AWAL\"")]
+    BadMagic { found: [u8; 4] },
+
+    #[error("log format version {found}, this build reads version {supported}")]
+    UnsupportedVersion { found: u32, supported: u32 },
+
+    /// The record's checksum was valid, so its bytes are intact — they simply describe an
+    /// operation this build does not implement. Skipping it would drop a committed record.
+    #[error("record {seq} carries operation {op:#04x}, which this build does not understand")]
+    UnknownOp { seq: u64, op: u8 },
+
+    /// Intact bytes that do not parse. The usual cause is a log written against a different
+    /// vector dimension, which is why the arithmetic is required to be exact rather than
+    /// generous.
+    #[error("record {seq} (op {op:#04x}) is malformed: {reason}")]
+    MalformedPayload {
+        seq: u64,
+        op: u8,
+        reason: &'static str,
+    },
+
+    #[error("record of {bytes} bytes exceeds the {limit}-byte limit")]
+    RecordTooLarge { bytes: usize, limit: usize },
+
+    /// Replay records a level rather than drawing one, so a level past the index's guard means
+    /// the log and this build disagree about the graph's shape.
+    #[error("record {seq} assigns level {level}, above the supported maximum")]
+    LevelOutOfRange { seq: u64, level: u8 },
+
+    #[error(transparent)]
+    Vector(#[from] anka_core::VectorError),
+
+    #[error(transparent)]
+    Index(#[from] anka_index::IndexError),
+}
+
+impl WalError {
+    pub(crate) fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
+        Self::Io {
+            path: path.into(),
+            source,
+        }
+    }
+}

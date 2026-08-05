@@ -39,8 +39,9 @@ own snapshot section, not an afterthought.
 
 ```rust
 pub enum Storage {
-    Owned(Vec<f32>),   // build / insert path
-    Mapped(Mmap),      // loaded from a snapshot, zero-copy
+    Owned(Vec<f32>),                       // build / insert path
+    Mapped { map: Mmap, offset: usize },   // loaded from a snapshot, zero-copy
+    Hybrid { map: Mmap, offset: usize, mapped_count: usize, owned: Vec<f32> },
 }
 ```
 
@@ -53,6 +54,17 @@ quantization worthwhile: quantized codes stay resident in RAM while the full-pre
 needed for rescoring are paged in from the mapping on demand. `&[u8] → &[f32]` conversion goes
 through `bytemuck`, which keeps the alignment and size checks in one audited place instead of
 scattering `unsafe` transmutes across the codebase.
+
+`Hybrid` exists because recovery needs it: a snapshot is mapped read-only and then the write-ahead
+log is replayed on top of it, and those replayed vectors have nowhere to go inside a read-only
+mapping. A mapped store therefore becomes hybrid on its first `push`. The alternative — copying the
+mapping into owned memory on first write — is half a gigabyte on SIFT1M, paid by any collection
+that is ever written to, which defeats the reason for mapping it.
+
+The cost is that a store is no longer always one flat slice, so hot loops take a resolved `Vectors`
+view and index it rather than chunking `as_slice()`. That moves a branch into the loop. It measures
+10.0–14.2% in a cache-resident microbenchmark and is **not detectable end to end**, where the
+search is latency-bound over 512 MB — see `docs/RESULTS.md`, section 4.
 
 ### Graph representation
 
@@ -81,29 +93,70 @@ everything above it.
 
 ### Snapshot (`collection.anka`)
 
+Everything is little-endian; the crate refuses to compile on a big-endian target rather than
+carry a byte-swapping path nobody can test.
+
 ```
-[ Header 128B ]
-  magic "ANKA" | format_version u32 | dim u32 | count u32 | live_count u32
-  metric u8 | M u16 | Mmax0 u16 | ef_construction u16
-  entry_point u32 | max_layer u8
-  rng_seed u64            # reproducibility: layer assignment is seeded
-  wal_seq u64             # this snapshot contains WAL records up to and including this seq
-  header_crc32 u32        # covers the header only
-  body_crc32 u32          # covers the body
-  section_offsets 6 × u64 # vectors, layer_count, layers, tombstones, id_map, metadata
-[ Vectors    ]  count × dim × 4B, fp32, starting at offset 128
-[ LayerCount ]  count × 1B
-[ Layers     ]  layer 0: dense slot array; layers ≥ 1: node_count + NodeId list + slot array
-[ Tombstones ]  serialised roaring bitmap
-[ IdMap      ]  entry_count + (ExternalId, NodeId) pairs
-[ Metadata   ]  bincode
+off  size  field
+  0     4  magic "ANKA"
+  4     4  format_version
+  8     4  dim
+ 12     4  count            NodeId space, live + tombstoned
+ 16     4  live_count
+ 20     4  entry_point      u32::MAX means none
+ 24     8  rng_seed         reproducibility: layer assignment is seeded
+ 32     8  levels_drawn     how many levels the generator has produced
+ 40     8  wal_seq          this snapshot contains WAL records up to and including this seq
+ 48     2  M
+ 50     2  max_degree0
+ 52     2  ef_construction
+ 54     1  metric
+ 55     1  max_layer
+ 56    48  section_offsets[6]   vectors, node_levels, layers, tombstones, id_map, metadata
+104     8  body_len
+112     4  body_crc32       covers the body
+116     4  flags            heuristic, keep_pruned
+120     4  reserved
+124     4  header_crc32     covers bytes 0..124
+
+[ Vectors     ]  count × dim × 4B, fp32, starting at offset 128
+[ NodeLevels  ]  count × 1B
+[ Layers      ]  layer 0: adjacency only; layers ≥ 1: node_count + NodeId list + adjacency
+[ Tombstones  ]  serialised roaring bitmap        (phase 4)
+[ IdMap       ]  entry_count + (ExternalId, NodeId) pairs   (phase 4)
+[ Metadata    ]  bincode                          (phase 4)
 ```
 
-Two checksums with two different policies: `header_crc32` is verified on every open (cheap, and
-it catches a truncated or foreign file immediately), while `body_crc32` is verified only on
-`--verify`, in crash tests, and in CI. Scanning 700 MB on every open would defeat the entire
-purpose of a lazy, zero-copy mapping. `section_offsets` exists so sections can be reached
-without parsing sequentially, which a memory-mapped reader needs.
+Four decisions in that layout are worth stating, because each one closes a failure mode.
+
+**`header_crc32` covers everything before it, not just the fixed fields.** An earlier draft scoped
+it to the first 96 bytes, which left `section_offsets` unprotected — a corrupted offset would have
+passed the header check and then been used to slice into the mapping.
+
+**Section offsets are 8-byte aligned, and the header rejects any that are not.** Sections are cast
+straight out of the mapping, and `bytemuck` *panics* on a misaligned cast. Without the check, a
+corrupt offset takes the process down, which is precisely what a snapshot reader must never let an
+untrusted file do. 8 rather than 4 because the id map stores `(u64, u32)` pairs.
+
+**`levels_drawn` is stored and the node count is not enough.** WAL replay inserts a node at the
+level written in its record without drawing one, so a recovered index has more nodes than draws.
+Restoring the generator by re-drawing `levels_drawn` times puts it back on the same sequence;
+`StdRng` has no portable state export, and a snapshot carrying an opaque blob would be tied to
+`rand`'s internals.
+
+**`flags` records how the graph was built, and unknown bits are an error.** A future version
+setting a flag this build does not understand has, by definition, built a graph whose shape it
+cannot reason about. Masking the bit off would produce plausible, wrong results.
+
+Two checksums with two different policies: `header_crc32` is verified on every open (124 bytes,
+free, and it catches a truncated or foreign file immediately), while `body_crc32` is verified only
+on request — in crash tests and CI. Scanning 700 MB on every open would defeat the entire purpose
+of a lazy, zero-copy mapping.
+
+**Nothing derivable is stored.** The `NodeId → slot` table is the inverse of the slot list and is
+rebuilt on load; two copies of one fact on disk can disagree. Section lengths are likewise computed
+from the header and the file is required to match them, so a header that lies is an error before
+any of its numbers index into the mapping.
 
 Snapshots are written atomically, and the order is not negotiable:
 
@@ -113,6 +166,21 @@ write collection.anka.tmp → fsync(file) → rename → fsync(directory)
 
 Skipping the directory `fsync` means a crash can lose the rename even though the file contents
 were durable.
+
+### Loading: mapped or read
+
+Two loaders, because they are the two ends of one trade rather than a fast path and a fallback.
+`load` maps the file and returns immediately at any size, deferring the cost of each page to
+whichever query first touches it. `read` pulls the whole file into owned memory up front.
+
+Which is better depends entirely on how much of a collection a workload visits, and a graph search
+visits very little of it — that is the argument for mapping, and having both turns it into an
+experiment. `anka snapshot` runs it, reporting each loader's open time *next to* a cold query pass,
+because a load time that excludes the page faults it postponed is not a load time.
+
+Only the vectors are mapped. Levels and adjacency are copied either way: the in-memory graph owns
+its arrays, and a read-only mapping cannot be mutated by the inserts that follow a checkpoint.
+Pushing a vector into a mapped store transitions it to the hybrid variant described in section 2.
 
 ### Write-ahead log (`wal.log`)
 
