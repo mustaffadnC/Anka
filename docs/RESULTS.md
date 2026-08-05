@@ -701,23 +701,88 @@ checkpoint-then-continue, and it is *not* a cold process start — there, both l
 disk I/O and the ratio would move. Dropping the cache needs root, which this measurement harness
 does not take. The resident-memory figures are unaffected by cache state.
 
+### What durability costs
+
+`anka ingest siftsmall --limit 10000`, three policies, alternating in one session per the rule
+above. Same vectors, same graph, only the flushing differs.
+
+| `--fsync` | round 1 | round 2 | inserts/s | vs `never` |
+|---|---|---|---|---|
+| `never` | 707.9 ms | 673.0 ms | ~14 500 | — |
+| `every:100` | 1.01 s | 969.2 ms | ~10 100 | 1.4× |
+| `always` | 18.0 s | 27.3 s | 366–555 | **26–40×** |
+
+**An `fsync` per record costs about 2.2 ms here, and that dominates everything else.** Insert
+itself — a graph traversal at `ef_construction`=200 — takes 69 µs. Durability is 30× the work of
+the operation it protects, which is the number to have in mind before treating `always` as a
+free default.
+
+`every:100` lands where the arithmetic says it should: 100 flushes instead of 10 000, so ~0.22 s of
+flushing on top of 0.69 s of work, against 0.99 s measured.
+
+Two caveats. The `always` figures moved **1.52× between the two rounds of one session** — `fsync`
+latency is far noisier than CPU work, so that column is a range and not a number. And this is
+WSL2's virtual disk (ext4 inside a VHDX on NVMe); `fsync` latency on bare metal would differ, so
+the *ratio* travels better than the absolute cost.
+
+Checkpointing 10 000 records: **42.9 ms**, and the log goes from 5.2 MiB to its 16-byte header
+while the snapshot becomes 6.2 MiB. Reopening that collection and replaying the whole log instead
+took 730 ms — which is what a checkpoint buys.
+
 ### Durability
 
 | Check | Result |
 |---|---|
 | 1M index write → reload, results bit-identical | **1 000/1 000 queries, ids and distances** |
 | mmap load time vs full read | **87.2 ms vs 1.10 s; 289.0 MiB vs 645.8 MiB resident** |
+| WAL replay path, results bit-identical | **graph compared edge by edge, not by recall** |
 | Corrupt snapshot: truncation, flipped bit, foreign file | **every case an `Err`, no panic** |
-| Torn WAL: truncated `len` / truncated payload / bad CRC | **byte-exhaustive at record level** |
-| WAL replay path, results bit-identical | *pending* |
-| Torn WAL: `seq` gap | *pending* |
-| `kill -9` during WAL write, `fsync=always` | *pending* |
-| `kill -9` during snapshot write | *pending* |
+| Torn WAL: truncated `len` / truncated payload / bad CRC / `seq` gap | **all four, byte-exhaustive** |
+| `kill -9` during WAL write, `fsync=always` | **500 acknowledged → 501 recovered** |
+| `kill -9` during checkpointing | **120 acknowledged → 121 recovered** |
+| `kill -9`, three restarts in a row | **300 → 301 each time** |
 
-The snapshot corruption row is exhaustive rather than sampled: the test flips **each** of the 128
-header bytes in turn and requires every one to be rejected, and truncates the file at every length
-that could still carry a header. The torn-WAL row is the same shape — every prefix length of a
-record's framing and payload, and every single-bit flip across a whole record.
+Two rows are exhaustive rather than sampled. Snapshot corruption: **each** of the 128 header bytes
+is flipped in turn and every one must be rejected, and the file is truncated at every length that
+could still carry a header. Torn WAL: every prefix length of a record's framing and payload, and
+every single-bit flip across a whole record — with recovery required to land on the same
+seven-record index each time.
+
+The kill fires on a **record count, not a timer**. A fixed delay would make the test's meaning
+depend on how fast the machine is: on a slow runner the child might not have written anything worth
+killing, and the assertions would pass while proving nothing. Waiting for a specific acknowledgement
+means the kill always lands on a writer that is demonstrably mid-flight — a slow machine makes the
+test slower, never weaker. It also made the suite deterministic and cut it from 9.4 s to 1.2 s.
+
+Every kill recovers **exactly one record more than was acknowledged**: the child's `insert` had
+returned and it died before it could print the id. That is the expected shape and the test asserts
+both bounds — recovering fewer would mean an acknowledged record was lost, and recovering *two*
+more would mean a record reached the index before it reached the log.
+
+### A process kill cannot tear a record, which is a design consequence
+
+Across every `kill -9` above, and 8 further kills run for no other purpose, **the log tail was
+clean every single time — 0 of 8.** Not luck. `SIGKILL` does not interrupt a `write()` in
+progress: the kernel completes the syscall and delivers the signal afterwards. A record is
+assembled in one buffer and issued as a single `write_all`, so a process crash lands *between*
+records and never inside one. This held across roughly 5 000 kills' worth of records at two
+different sync policies, and across an earlier timer-triggered version of the same suite.
+
+This corrects what the phase 3 plan expected of the crash test. **`kill -9` does not exercise
+torn-record handling and cannot be made to.** That path exists for power loss and media failure,
+and is tested against synthetic damage instead — which is the stronger test anyway, since it covers
+every truncation point and every bit rather than whichever one a race happened to produce.
+
+It also makes the single-write choice load-bearing rather than stylistic, so it is asserted: the
+test fails if a future change splits the append into framing-then-payload, because kills would
+start tearing records.
+
+**What the crash tests prove:** recovery survives an abrupt stop at any point, including during a
+checkpoint and across repeated restarts, and no record acknowledged under `fsync=always` is lost.
+**What they do not prove:** power-loss durability. `kill -9` leaves the page cache intact, so bytes
+that reached the kernel are readable afterwards whether or not anything was flushed — which is why
+the same test passes under `fsync=never`, and why passing it is not evidence of durability. That
+would need fault injection at the block layer, and is not claimed.
 
 **What the crash test proves:** recovery survives a torn log and an interrupted snapshot, and no
 record acknowledged under `fsync=always` is lost to a process kill.

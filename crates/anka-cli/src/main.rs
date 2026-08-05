@@ -18,6 +18,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
 mod bench;
+mod durable;
 mod snapshot;
 
 #[derive(Parser, Debug)]
@@ -41,6 +42,10 @@ enum Command {
     Bench(bench::BenchArgs),
     /// Write an index to disk, load it back both ways, and check the answers are unchanged.
     Snapshot(snapshot::SnapshotArgs),
+    /// Build a durable collection from a dataset, logging every insert.
+    Ingest(durable::IngestArgs),
+    /// Fold a collection's log into a snapshot and start a fresh one.
+    Checkpoint(durable::CheckpointArgs),
 }
 
 #[derive(Args, Debug)]
@@ -145,6 +150,8 @@ fn main() -> Result<()> {
         Command::Gt(args) => check_ground_truth(args),
         Command::Bench(args) => bench::run(args),
         Command::Snapshot(args) => snapshot::run(args),
+        Command::Ingest(args) => durable::ingest(args),
+        Command::Checkpoint(args) => durable::checkpoint(args),
     }
 }
 
