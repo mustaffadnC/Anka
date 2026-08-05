@@ -40,6 +40,25 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-features
 
+  # The crash tests spawn a child, SIGKILL it mid-write, and require recovery to keep every
+  # acknowledged record. They already run in the job above; this one runs them alone, with output,
+  # so a durability failure is legible in the log rather than a line in a summary. They trigger on
+  # a record count rather than a timer, so a slow runner makes them slower, never weaker.
+  durability:
+    name: crash recovery
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Crash tests
+        run: cargo test -p anka-store --test crash -- --nocapture --test-threads=1
+
   # Builds an index on real data and fails if recall@10 falls below the threshold. A correctness
   # gate, not a performance one: no target-cpu=native, and no timing is asserted, because the
   # runner is not the benchmark machine.

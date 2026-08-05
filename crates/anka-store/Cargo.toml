@@ -18,3 +18,8 @@ thiserror = "2.0.19"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# The crash tests send a real SIGKILL. `Child::kill` sends SIGKILL too on Unix, but the test also
+# needs to target a process it is deliberately not reaping first, so the syscall is used directly.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
