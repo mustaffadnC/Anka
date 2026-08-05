@@ -187,3 +187,31 @@ impl WalError {
         }
     }
 }
+
+/// A collection could not be brought back up to date.
+///
+/// Distinct from a torn tail, which is not an error at all — see [`crate::recovery::Tail`]. What
+/// reaches this type is a snapshot and a log that cannot be reconciled, and in every case the
+/// files are reported rather than repaired: an operator can look at them, and nothing has been
+/// silently discarded on their behalf.
+#[derive(Debug, thiserror::Error)]
+pub enum RecoveryError {
+    #[error(transparent)]
+    Snapshot(#[from] SnapshotError),
+
+    #[error(transparent)]
+    Wal(#[from] WalError),
+
+    /// The log begins after the point the snapshot reaches, so the records in between exist
+    /// nowhere. Proceeding would produce an index missing acknowledged data and no sign of it.
+    #[error(
+        "the snapshot contains records up to {contains} and the log starts at {found}: \
+         everything in between is missing"
+    )]
+    MissingRecords { contains: u64, found: u64 },
+
+    /// Deletion arrives in phase 4. Nothing in this build writes such a record, so one can only
+    /// have come from a build that implements it — and skipping it loses an acknowledged delete.
+    #[error("record {seq} is a delete, which this build cannot replay (deletion is phase 4)")]
+    CannotReplayDelete { seq: u64 },
+}

@@ -123,6 +123,37 @@ pub fn load(path: &Path, verify: Verify) -> Result<HnswIndex, SnapshotError> {
     parsed.into_index(vectors)
 }
 
+/// Reads and validates a snapshot's header without touching the rest of the file.
+///
+/// Recovery needs one field from it — `wal_seq`, which says where the log picks up — and reading
+/// 128 bytes to get it beats mapping 620 MB.
+pub fn header(path: &Path) -> Result<SnapshotHeader, SnapshotError> {
+    use std::io::Read;
+
+    let mut file = File::open(path).map_err(|e| SnapshotError::io(path, e))?;
+    let mut bytes = [0u8; HEADER_BYTES];
+    file.read_exact(&mut bytes).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            // The length is what matters here, not the read error's wording.
+            let got = std::fs::metadata(path)
+                .map(|m| m.len() as usize)
+                .unwrap_or(0);
+            SnapshotError::TooShort {
+                needed: HEADER_BYTES,
+                got,
+            }
+        } else {
+            SnapshotError::io(path, e)
+        }
+    })?;
+    SnapshotHeader::decode(&bytes)
+}
+
+/// The last write-ahead-log record this snapshot already contains.
+pub fn wal_seq(path: &Path) -> Result<u64, SnapshotError> {
+    Ok(header(path)?.wal_seq)
+}
+
 /// Reads a snapshot into owned memory and rebuilds the index from it.
 ///
 /// The alternative to [`load`], and the reason it exists: reading pays for every byte up front,
